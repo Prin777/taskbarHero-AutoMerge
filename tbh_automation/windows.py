@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import base64
 import ctypes
 import logging
-import math
 import os
 import struct
 import threading
@@ -14,6 +12,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Iterator
 
+from .autodetect import (
+    AutoDetectionResult,
+    find_auto_fill_anchor,
+    find_cube_icon,
+    layout_points_from_anchor,
+)
 from .engine import AutomationError, Category, ControlGate, RoundCancelled
 from .model import Calibration, Point, WindowIdentity
 
@@ -50,19 +54,20 @@ WM_QUIT = 0x0012
 VK_F7 = 0x76
 VK_F8 = 0x77
 VK_F9 = 0x78
+VK_TAB = 0x09
+KEYEVENTF_KEYUP = 0x0002
+TASKBAR_HERO_PROCESS = "taskbarhero.exe"
+TASKBAR_HERO_CLASS = "UnityWndClass"
+TASKBAR_HERO_TITLE = "TaskBarHero"
 
-# 自动填充过程中九格可能短暂全部出现，随后继续播放逐格动画。先等待画面
-# 稳定，再以合成按钮高亮作为最终点击条件。
-FULL_GRID_STABLE_SECONDS = 2.5
-OTHER_GRID_STABLE_SECONDS = 0.5
-GRID_OBSERVATION_TIMEOUT_SECONDS = 10.0
 CURSOR_SETTLE_SECONDS = 0.10
-SALIENT_PIXEL_FRACTION = 0.20
 MAX_DIAGNOSTIC_SCREENSHOTS = 200
 COMBINE_BUTTON_SAMPLE_SIZE = 32
 COMBINE_BUTTON_BLUE_RATIO_THRESHOLD = 0.25
 COMBINE_BUTTON_CONFIRMATIONS = 2
 COMBINE_BUTTON_CONFIRM_INTERVAL_SECONDS = 0.20
+COMBINE_BUTTON_INITIAL_WAIT_SECONDS = 0.65
+COMBINE_BUTTON_ACTIVATION_TIMEOUT_SECONDS = 3.0
 
 
 class BITMAPINFOHEADER(ctypes.Structure):
@@ -94,7 +99,18 @@ class BITMAPINFO(ctypes.Structure):
     _fields_ = [("bmiHeader", BITMAPINFOHEADER), ("bmiColors", RGBQUAD * 1)]
 
 
+ENUM_WINDOWS_CALLBACK = ctypes.WINFUNCTYPE(
+    wintypes.BOOL,
+    wintypes.HWND,
+    wintypes.LPARAM,
+)
+
+
 user32.GetForegroundWindow.restype = wintypes.HWND
+user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+user32.FindWindowW.restype = wintypes.HWND
+user32.EnumWindows.argtypes = [ENUM_WINDOWS_CALLBACK, wintypes.LPARAM]
+user32.EnumWindows.restype = wintypes.BOOL
 user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
 user32.GetAncestor.restype = wintypes.HWND
 user32.WindowFromPoint.argtypes = [wintypes.POINT]
@@ -108,6 +124,7 @@ user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
 user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
 user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
 user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
+user32.keybd_event.argtypes = [wintypes.BYTE, wintypes.BYTE, wintypes.DWORD, wintypes.WPARAM]
 user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
 user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.UINT]
 user32.BringWindowToTop.argtypes = [wintypes.HWND]
@@ -119,6 +136,9 @@ user32.GetWindow.restype = wintypes.HWND
 user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
 user32.IsWindow.argtypes = [wintypes.HWND]
 user32.IsWindowVisible.argtypes = [wintypes.HWND]
+user32.IsIconic.argtypes = [wintypes.HWND]
+user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+user32.ShowWindow.restype = wintypes.BOOL
 user32.GetDpiForWindow.argtypes = [wintypes.HWND]
 user32.GetDpiForWindow.restype = wintypes.UINT
 user32.GetDC.argtypes = [wintypes.HWND]
@@ -222,6 +242,61 @@ def window_matches(hwnd: int, identity: WindowIdentity) -> bool:
     return not identity.class_name or class_name == identity.class_name
 
 
+def is_taskbar_hero_identity(identity: WindowIdentity) -> bool:
+    return (
+        identity.process_name.casefold() == TASKBAR_HERO_PROCESS
+        and identity.class_name == TASKBAR_HERO_CLASS
+        and identity.client_width >= 300
+        and identity.client_height >= 300
+    )
+
+
+def find_taskbar_hero_window(preferred: WindowIdentity | None = None) -> int:
+    """从所有顶层窗口中安全定位游戏，不依赖用户先把游戏切到前台。"""
+    candidates: list[tuple[int, WindowIdentity]] = []
+    known = int(user32.FindWindowW(TASKBAR_HERO_CLASS, TASKBAR_HERO_TITLE) or 0)
+    if known and user32.IsWindowVisible(known):
+        try:
+            identity = describe_window(known)
+            if is_taskbar_hero_identity(identity):
+                candidates.append((known, identity))
+        except OSError:
+            pass
+
+    def collect(hwnd: int, _parameter: int) -> bool:
+        try:
+            value = int(hwnd)
+            if not user32.IsWindowVisible(value) or value == known:
+                return True
+            identity = describe_window(value)
+            if is_taskbar_hero_identity(identity):
+                candidates.append((value, identity))
+        except (OSError, ValueError):
+            pass
+        return True
+
+    callback = ENUM_WINDOWS_CALLBACK(collect)
+    user32.EnumWindows(callback, 0)
+    if not candidates:
+        foreground = get_foreground_root()
+        if foreground:
+            try:
+                identity = describe_window(foreground)
+                if is_taskbar_hero_identity(identity):
+                    candidates.append((foreground, identity))
+            except OSError:
+                pass
+    if not candidates:
+        return 0
+
+    def candidate_score(candidate: tuple[int, WindowIdentity]) -> tuple[int, int]:
+        hwnd, identity = candidate
+        preferred_match = int(preferred is not None and window_matches(hwnd, preferred))
+        return preferred_match, identity.client_width * identity.client_height
+
+    return max(candidates, key=candidate_score)[0]
+
+
 def cursor_capture() -> tuple[int, Point, WindowIdentity]:
     screen_point = wintypes.POINT()
     if not user32.GetCursorPos(ctypes.byref(screen_point)):
@@ -249,9 +324,53 @@ def client_to_screen(hwnd: int, point: Point) -> Point:
     return Point(value.x, value.y)
 
 
+def _window_at_screen_point(screen_point: Point) -> int:
+    return int(
+        user32.WindowFromPoint(wintypes.POINT(screen_point.x, screen_point.y)) or 0
+    )
+
+
 def point_is_visible_on_window(hwnd: int, screen_point: Point) -> bool:
-    covering = user32.WindowFromPoint(wintypes.POINT(screen_point.x, screen_point.y))
-    return bool(covering) and _root_window(int(covering)) == _root_window(hwnd)
+    covering = _window_at_screen_point(screen_point)
+    return bool(covering) and _root_window(covering) == _root_window(hwnd)
+
+
+def _screen_point_is_inside_client(hwnd: int, screen_point: Point) -> bool:
+    client_point = wintypes.POINT(screen_point.x, screen_point.y)
+    if not user32.ScreenToClient(hwnd, ctypes.byref(client_point)):
+        return False
+    width, height = get_client_size(hwnd)
+    return 0 <= client_point.x < width and 0 <= client_point.y < height
+
+
+def _window_is_topmost(hwnd: int) -> bool:
+    return bool(hwnd and user32.GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST)
+
+
+def point_is_safe_on_active_game(hwnd: int, screen_point: Point) -> bool:
+    """兼容透明 Unity 覆盖窗口，同时拒绝真正的置顶遮挡。"""
+    if point_is_visible_on_window(hwnd, screen_point):
+        return True
+    game_root = _root_window(hwnd)
+    if get_foreground_root() != game_root or not _window_is_topmost(game_root):
+        return False
+    covering = _window_at_screen_point(screen_point)
+    if not covering or not _screen_point_is_inside_client(hwnd, screen_point):
+        return False
+    covering_root = _root_window(covering)
+    if get_process_name(covering_root).casefold() == TASKBAR_HERO_PROCESS:
+        return True
+    # 游戏已经处于最上层时，透明区域的 WindowFromPoint 仍可能返回其下方的
+    # 资源管理器等普通窗口；这不是视觉遮挡。另一个置顶窗口则仍然拒绝。
+    if _window_is_topmost(covering_root):
+        return False
+    LOG.info(
+        "透明游戏窗口命中下层窗口，已按前台和置顶状态继续：title=%r class=%r process=%r",
+        get_window_title(covering_root),
+        get_class_name(covering_root),
+        get_process_name(covering_root),
+    )
+    return True
 
 
 def client_area_is_uncovered(hwnd: int) -> bool:
@@ -313,6 +432,10 @@ def _topmost_obstructions_above(hwnd: int) -> list[int]:
 def temporarily_uncover_window(hwnd: int, *, report_obstruction: bool = False) -> Iterator[None]:
     """截图或点击前真正激活并置顶游戏，避免置顶终端污染桌面取图。"""
     was_topmost = bool(user32.GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST)
+    if user32.IsIconic(hwnd):
+        user32.ShowWindow(hwnd, SW_RESTORE)
+        time.sleep(0.15)
+        LOG.info("自动界面准备：已从最小化状态恢复 TaskBarHero")
     if report_obstruction and not client_area_is_uncovered(hwnd):
         LOG.warning("检测到游戏窗口被遮挡，采集期间将激活并临时置于最上层")
     activate_flags = SWP_NOMOVE | SWP_NOSIZE
@@ -379,6 +502,42 @@ def temporarily_uncover_window(hwnd: int, *, report_obstruction: bool = False) -
                 user32.SetWindowPos(candidate, HWND_TOPMOST, 0, 0, 0, 0, restore_flags)
 
 
+def press_tab_on_game(hwnd: int) -> None:
+    """激活已经严格识别的游戏窗口，并发送一次英雄菜单快捷键。"""
+    with temporarily_uncover_window(hwnd, report_obstruction=True):
+        if get_foreground_root() != _root_window(hwnd):
+            raise ValueError("无法激活游戏，未发送 Tab")
+        user32.keybd_event(VK_TAB, 0, 0, 0)
+        user32.keybd_event(VK_TAB, 0, KEYEVENTF_KEYUP, 0)
+        LOG.info("自动界面准备：已向 TaskBarHero 发送 Tab，打开英雄背包")
+
+
+def click_game_point(hwnd: int, point: Point, label: str) -> None:
+    """校准前只允许在已识别游戏客户区的可见位置执行一次安全点击。"""
+    with temporarily_uncover_window(hwnd, report_obstruction=True):
+        screen = client_to_screen(hwnd, point)
+        if not point_is_safe_on_active_game(hwnd, screen):
+            raise ValueError(f"{label}被其他窗口遮挡，未执行点击")
+        if not user32.SetCursorPos(screen.x, screen.y):
+            raise ValueError(f"无法移动鼠标到{label}")
+        time.sleep(CURSOR_SETTLE_SECONDS)
+        if get_foreground_root() != _root_window(hwnd) or not point_is_safe_on_active_game(
+            hwnd,
+            screen,
+        ):
+            raise ValueError(f"点击{label}前游戏失去前台，已取消")
+        user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+        LOG.info(
+            "自动界面准备：点击%s，客户区坐标=(%d,%d)，屏幕坐标=(%d,%d)",
+            label,
+            point.x,
+            point.y,
+            screen.x,
+            screen.y,
+        )
+
+
 def capture_client_patch(hwnd: int, center: Point, size: int) -> bytes:
     image, width, height = capture_client_bgra(hwnd)
     half = size // 2
@@ -417,6 +576,63 @@ def capture_client_bgra(hwnd: int) -> tuple[bytes, int, int]:
         gdi32.DeleteObject(bitmap)
         gdi32.DeleteDC(memory_dc)
         user32.ReleaseDC(0, screen_dc)
+
+
+def open_synthesis_interface(
+    hwnd: int,
+    *,
+    wait: Callable[[float], None] | None = None,
+) -> tuple[bytes, int, int, AutoDetectionResult]:
+    """必要时打开英雄背包和魔方，并返回自动填充文字的识别结果。"""
+    pause = wait or time.sleep
+
+    def capture() -> tuple[bytes, int, int]:
+        with temporarily_uncover_window(hwnd, report_obstruction=True):
+            return capture_client_bgra(hwnd)
+
+    def detect(
+        image: bytes,
+        width: int,
+        height: int,
+    ) -> AutoDetectionResult:
+        dpi = get_window_dpi(hwnd)
+        return find_auto_fill_anchor(
+            image,
+            width,
+            height,
+            preferred_scale=dpi / 96,
+            require_button_color=True,
+        )
+
+    image, width, height = capture()
+    try:
+        cube = find_cube_icon(image, width, height)
+        LOG.info("英雄背包已打开：识别到魔方入口 %s", cube)
+    except ValueError:
+        LOG.info("当前未显示英雄背包，开始自动准备界面")
+        press_tab_on_game(hwnd)
+        pause(1.0)
+        image, width, height = capture()
+        cube = find_cube_icon(image, width, height)
+        LOG.info("按 Tab 后识别到魔方入口：%s", cube)
+    else:
+        try:
+            return image, width, height, detect(image, width, height)
+        except ValueError:
+            LOG.info("英雄背包已打开，但当前未显示魔方合成窗口")
+
+    click_game_point(hwnd, cube.center, "黄色魔方入口")
+    pause(1.2)
+    image, width, height = capture()
+    try:
+        return image, width, height, detect(image, width, height)
+    except ValueError:
+        # 魔方原先若停在不含自动填充的功能页，第一次点击可能关闭窗口；
+        # 再点一次按游戏默认行为重新打开到“合成”。
+        click_game_point(hwnd, cube.center, "黄色魔方入口（重新打开合成）")
+        pause(1.2)
+        image, width, height = capture()
+        return image, width, height, detect(image, width, height)
 
 
 def bitmap_bgra(memory_dc: int, bitmap: int, width: int, height: int) -> bytes:
@@ -519,97 +735,6 @@ def save_bgra_bmp(path: Path, image_bgra: bytes, width: int, height: int) -> Pat
     return path
 
 
-def grid_centers(calibration: Calibration) -> list[Point]:
-    top_left = calibration.points["grid_top_left"]
-    bottom_right = calibration.points["grid_bottom_right"]
-    centers: list[Point] = []
-    for row in range(3):
-        for column in range(3):
-            x = round(top_left.x + (bottom_right.x - top_left.x) * column / 2)
-            y = round(top_left.y + (bottom_right.y - top_left.y) * row / 2)
-            centers.append(Point(x, y))
-    return centers
-
-
-def encode_empty_grid(hwnd: int, calibration: Calibration) -> list[str]:
-    patches: list[str] = []
-    image, width, height = capture_client_bgra(hwnd)
-    for center in grid_centers(calibration):
-        screen = client_to_screen(hwnd, center)
-        if not point_is_visible_on_window(hwnd, screen):
-            raise ValueError("校准时九宫格被其他窗口遮挡，请移开遮挡后重试")
-        half = calibration.patch_size // 2
-        patch = crop_bgra(
-            image,
-            width,
-            height,
-            center.x - half,
-            center.y - half,
-            calibration.patch_size,
-            calibration.patch_size,
-        )
-        patches.append(base64.b64encode(patch).decode("ascii"))
-    return patches
-
-
-def encoded_grid_looks_empty(encoded_patches: list[str], maximum_average_difference: float = 15.0) -> bool:
-    if len(encoded_patches) != 9:
-        return False
-    patches = [base64.b64decode(value) for value in encoded_patches]
-    differences = [
-        mean_absolute_difference(patches[left], patches[right])
-        for left in range(9)
-        for right in range(left)
-    ]
-    return bool(differences) and sum(differences) / len(differences) <= maximum_average_difference
-
-
-def mean_absolute_difference(left: bytes, right: bytes) -> float:
-    if len(left) != len(right) or not left:
-        raise ValueError("图像采样块尺寸不一致")
-    # 忽略恒为 0/255 的 alpha 通道。
-    total = 0
-    channels = 0
-    for index in range(0, len(left), 4):
-        total += abs(left[index] - right[index])
-        total += abs(left[index + 1] - right[index + 1])
-        total += abs(left[index + 2] - right[index + 2])
-        channels += 3
-    return total / channels
-
-
-def salient_pixel_difference(
-    left: bytes,
-    right: bytes,
-    fraction: float = SALIENT_PIXEL_FRACTION,
-) -> float:
-    """返回变化最明显的一部分像素的平均 RGB 差异。
-
-    普通品质图标可能只有边缘少量像素区别于空格背景；全图平均会把这些变化
-    稀释掉。取显著像素仍能识别图标，同时忽略 alpha 通道。
-    """
-    if len(left) != len(right) or not left or len(left) % 4:
-        raise ValueError("图像采样块尺寸不一致")
-    if not 0 < fraction <= 1:
-        raise ValueError("显著像素比例必须在 0 到 1 之间")
-    pixel_differences = [
-        (
-            abs(left[index] - right[index])
-            + abs(left[index + 1] - right[index + 1])
-            + abs(left[index + 2] - right[index + 2])
-        )
-        / 3
-        for index in range(0, len(left), 4)
-    ]
-    selected_count = max(1, math.ceil(len(pixel_differences) * fraction))
-    pixel_differences.sort(reverse=True)
-    return sum(pixel_differences[:selected_count]) / selected_count
-
-
-def count_filled_cells(differences: list[float], threshold: float) -> int:
-    return sum(difference >= threshold for difference in differences)
-
-
 def blue_highlight_ratio(image_bgra: bytes) -> float:
     """计算按钮采样块中蓝/青色高亮像素的比例。"""
     if not image_bgra or len(image_bgra) % 4:
@@ -651,13 +776,9 @@ class Win32AutomationDriver:
             if diagnostics_dir is not None
             else 0
         )
-        self._diagnostic_limit_logged = False
-        self._empty_patches = [base64.b64decode(value) for value in calibration.empty_grid_patches]
-        self._last_mean_differences: list[float] = []
-        self._last_salient_differences: list[float] = []
 
     def _foreground(self) -> int:
-        return get_foreground_root()
+        return find_taskbar_hero_window(self.calibration.window)
 
     def checkpoint(self) -> None:
         if self.gate.shutdown_requested or self.generation != self.gate.generation or not self.gate.enabled:
@@ -666,15 +787,45 @@ class Win32AutomationDriver:
             hwnd = self._foreground()
             if window_matches(hwnd, self.calibration.window):
                 return
-            self.status("等待游戏窗口位于前台")
+            if hwnd:
+                raise AutomationError("游戏窗口尺寸或显示缩放已改变，请重新自动识别位置")
+            self.status("等待 TaskBarHero 游戏启动")
             self.gate.wait_enabled(self.generation, 0.25)
+
+    def prepare_interface(self) -> None:
+        self.checkpoint()
+        hwnd = self._foreground()
+        try:
+            _image, width, height, result = open_synthesis_interface(
+                hwnd,
+                wait=lambda seconds: self.gate.interruptible_wait(
+                    seconds,
+                    self.generation,
+                ),
+            )
+        except ValueError as error:
+            raise AutomationError(f"自动准备游戏界面失败：{error}") from error
+        if (width, height) != (
+            self.calibration.window.client_width,
+            self.calibration.window.client_height,
+        ):
+            raise AutomationError("游戏窗口尺寸在界面准备期间发生变化，请重新自动识别")
+        self.calibration.points.update(
+            layout_points_from_anchor(result.anchor, result.scale)
+        )
+        LOG.info(
+            "合成界面准备完成：anchor=(%d,%d) scale=%.2f，全部按钮位置已刷新",
+            result.anchor.x,
+            result.anchor.y,
+            result.scale,
+        )
 
     def _click(self, key: str) -> None:
         self.checkpoint()
         hwnd = self._foreground()
         with temporarily_uncover_window(hwnd):
             screen = client_to_screen(hwnd, self.calibration.points[key])
-            if not point_is_visible_on_window(hwnd, screen):
+            if not point_is_safe_on_active_game(hwnd, screen):
                 raise AutomationError("游戏操作区域被其他窗口遮挡，请移开遮挡窗口后重新开启")
             if not user32.SetCursorPos(screen.x, screen.y):
                 raise AutomationError("无法移动鼠标到游戏操作位置，已暂停")
@@ -684,7 +835,9 @@ class Win32AutomationDriver:
             self.checkpoint()
             hwnd = self._foreground()
             screen = client_to_screen(hwnd, self.calibration.points[key])
-            if not point_is_visible_on_window(hwnd, screen):
+            if get_foreground_root() != _root_window(hwnd):
+                raise AutomationError("点击前游戏失去前台，已取消操作")
+            if not point_is_safe_on_active_game(hwnd, screen):
                 raise AutomationError("游戏操作区域被其他窗口遮挡，请移开遮挡窗口后重新开启")
             if not user32.SetCursorPos(screen.x, screen.y):
                 raise AutomationError("无法移动鼠标到游戏操作位置，已暂停")
@@ -712,91 +865,6 @@ class Win32AutomationDriver:
             user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
             self.gate.interruptible_wait(self.click_delay, self.generation)
 
-    def _filled_count_once(self) -> int:
-        self.checkpoint()
-        hwnd = self._foreground()
-        mean_differences: list[float] = []
-        salient_differences: list[float] = []
-        with temporarily_uncover_window(hwnd):
-            image, width, height = capture_client_bgra(hwnd)
-            for center, empty in zip(grid_centers(self.calibration), self._empty_patches, strict=True):
-                screen = client_to_screen(hwnd, center)
-                if not point_is_visible_on_window(hwnd, screen):
-                    raise AutomationError("九宫格被其他窗口遮挡，已暂停以避免误判")
-                half = self.calibration.patch_size // 2
-                current = crop_bgra(
-                    image,
-                    width,
-                    height,
-                    center.x - half,
-                    center.y - half,
-                    self.calibration.patch_size,
-                    self.calibration.patch_size,
-                )
-                mean_differences.append(mean_absolute_difference(current, empty))
-                salient_differences.append(salient_pixel_difference(current, empty))
-        self._last_mean_differences = mean_differences
-        self._last_salient_differences = salient_differences
-        count = count_filled_cells(salient_differences, self.calibration.difference_threshold)
-        LOG.info(
-            "九宫格识别：%d/9，显著像素阈值 %.1f，显著差异 %s，整体平均 %s",
-            count,
-            self.calibration.difference_threshold,
-            ", ".join(f"{difference:.1f}" for difference in salient_differences),
-            ", ".join(f"{difference:.1f}" for difference in mean_differences),
-        )
-        return count
-
-    def _save_grid_diagnostic(self, label: str, count: int | None) -> None:
-        diagnostics_dir = getattr(self, "diagnostics_dir", None)
-        if diagnostics_dir is None:
-            return
-        if self._diagnostic_index >= MAX_DIAGNOSTIC_SCREENSHOTS:
-            if not self._diagnostic_limit_logged:
-                LOG.warning(
-                    "本次会话诊断截图已达到 %d 张上限，后续只记录文字日志",
-                    MAX_DIAGNOSTIC_SCREENSHOTS,
-                )
-                self._diagnostic_limit_logged = True
-            return
-        try:
-            self._diagnostic_index += 1
-            hwnd = self._foreground()
-            if not window_matches(hwnd, self.calibration.window):
-                LOG.info("诊断截图已跳过：游戏窗口当前不在前台")
-                return
-            with temporarily_uncover_window(hwnd):
-                centers = grid_centers(self.calibration)
-                half = self.calibration.patch_size // 2
-                padding = 8
-                client_width, client_height = get_client_size(hwnd)
-                left = max(0, min(point.x for point in centers) - half - padding)
-                top = max(0, min(point.y for point in centers) - half - padding)
-                right = min(client_width, max(point.x for point in centers) + half + padding)
-                bottom = min(client_height, max(point.y for point in centers) + half + padding)
-                client_image, captured_width, captured_height = capture_client_bgra(hwnd)
-                image = crop_bgra(
-                    client_image,
-                    captured_width,
-                    captured_height,
-                    left,
-                    top,
-                    right - left,
-                    bottom - top,
-                )
-            timestamp = datetime.now().strftime("%H%M%S-%f")
-            count_suffix = "" if count is None else f"-{count}of9"
-            filename = f"{timestamp}-{self._diagnostic_index:04d}-{label}{count_suffix}.bmp"
-            path = save_bgra_bmp(diagnostics_dir / filename, image, right - left, bottom - top)
-            LOG.info(
-                "九宫格诊断截图：%s；显著差异=%s；整体平均=%s",
-                path,
-                ", ".join(f"{value:.1f}" for value in self._last_salient_differences),
-                ", ".join(f"{value:.1f}" for value in self._last_mean_differences),
-            )
-        except Exception:
-            LOG.exception("保存九宫格诊断截图失败，但自动化将继续运行")
-
     def select_category(self, category: Category) -> None:
         self._click("category_dropdown")
         key = "category_equipment" if category is Category.EQUIPMENT else "category_material"
@@ -805,43 +873,13 @@ class Win32AutomationDriver:
     def click_auto_fill(self) -> None:
         self._click("auto_fill")
 
-    def observe_filled_cells(self) -> int:
-        self.gate.interruptible_wait(0.65, self.generation)
-        deadline = time.monotonic() + GRID_OBSERVATION_TIMEOUT_SECONDS
-        previous: int | None = None
-        stable_since: float | None = None
-        latest = 0
-        while time.monotonic() < deadline:
-            latest = self._filled_count_once()
-            observed_at = time.monotonic()
-            self.status(f"正在识别合成格：{latest}/9")
-            if latest == previous:
-                if stable_since is None:
-                    stable_since = observed_at
-            else:
-                previous = latest
-                stable_since = observed_at
-            required_stability = (
-                FULL_GRID_STABLE_SECONDS if latest == 9 else OTHER_GRID_STABLE_SECONDS
-            )
-            assert stable_since is not None
-            if observed_at - stable_since >= required_stability:
-                self._save_grid_diagnostic("fill-stable", latest)
-                return latest
-            self.gate.interruptible_wait(0.25, self.generation)
-        if latest == 9:
-            self._save_grid_diagnostic("fill-unstable", latest)
-            raise AutomationError("九宫格虽已填满但画面一直未稳定，未点击合成并已暂停")
-        self._save_grid_diagnostic("fill-timeout", latest)
-        return latest
-
     def _combine_button_ratio_once(self) -> tuple[float, bytes]:
         self.checkpoint()
         hwnd = self._foreground()
         with temporarily_uncover_window(hwnd):
             center = self.calibration.points["combine"]
             screen = client_to_screen(hwnd, center)
-            if not point_is_visible_on_window(hwnd, screen):
+            if not point_is_safe_on_active_game(hwnd, screen):
                 raise AutomationError("合成按钮被其他窗口遮挡，已禁止点击")
             image = capture_client_patch(hwnd, center, COMBINE_BUTTON_SAMPLE_SIZE)
         return blue_highlight_ratio(image), image
@@ -868,33 +906,47 @@ class Win32AutomationDriver:
             LOG.exception("保存合成按钮诊断截图失败，但自动化将继续运行")
 
     def combine_button_is_enabled(self) -> bool:
-        """连续确认按钮为蓝色高亮；任一采样不满足时均禁止合成。"""
+        """等待自动填充完成，并连续确认按钮为蓝色高亮。"""
         latest_image = b""
-        ratios: list[float] = []
-        self.gate.interruptible_wait(0.15, self.generation)
-        for sample_index in range(COMBINE_BUTTON_CONFIRMATIONS):
+        consecutive_blue: list[float] = []
+        self.status("正在等待合成按钮激活")
+        self.gate.interruptible_wait(
+            COMBINE_BUTTON_INITIAL_WAIT_SECONDS,
+            self.generation,
+        )
+        deadline = time.monotonic() + COMBINE_BUTTON_ACTIVATION_TIMEOUT_SECONDS
+        while True:
             ratio, latest_image = self._combine_button_ratio_once()
-            ratios.append(ratio)
-            if ratio < COMBINE_BUTTON_BLUE_RATIO_THRESHOLD:
+            if ratio >= COMBINE_BUTTON_BLUE_RATIO_THRESHOLD:
+                consecutive_blue.append(ratio)
+                if len(consecutive_blue) >= COMBINE_BUTTON_CONFIRMATIONS:
+                    LOG.info(
+                        "合成按钮识别：蓝色可用，连续采样比例 %s（阈值 %.1f%%）",
+                        ", ".join(
+                            f"{value * 100:.1f}%"
+                            for value in consecutive_blue[-COMBINE_BUTTON_CONFIRMATIONS:]
+                        ),
+                        COMBINE_BUTTON_BLUE_RATIO_THRESHOLD * 100,
+                    )
+                    self._save_button_diagnostic(latest_image, ratio, True)
+                    return True
+            else:
+                consecutive_blue.clear()
+
+            if time.monotonic() >= deadline:
                 LOG.info(
-                    "合成按钮识别：灰色不可用，蓝色像素比例 %.1f%%（阈值 %.1f%%）",
+                    "合成按钮识别：等待 %.1f 秒后仍为灰色不可用，最后蓝色像素比例 "
+                    "%.1f%%（阈值 %.1f%%）",
+                    COMBINE_BUTTON_ACTIVATION_TIMEOUT_SECONDS,
                     ratio * 100,
                     COMBINE_BUTTON_BLUE_RATIO_THRESHOLD * 100,
                 )
                 self._save_button_diagnostic(latest_image, ratio, False)
                 return False
-            if sample_index + 1 < COMBINE_BUTTON_CONFIRMATIONS:
-                self.gate.interruptible_wait(
-                    COMBINE_BUTTON_CONFIRM_INTERVAL_SECONDS,
-                    self.generation,
-                )
-        LOG.info(
-            "合成按钮识别：蓝色可用，连续采样比例 %s（阈值 %.1f%%）",
-            ", ".join(f"{ratio * 100:.1f}%" for ratio in ratios),
-            COMBINE_BUTTON_BLUE_RATIO_THRESHOLD * 100,
-        )
-        self._save_button_diagnostic(latest_image, ratios[-1], True)
-        return True
+            self.gate.interruptible_wait(
+                COMBINE_BUTTON_CONFIRM_INTERVAL_SECONDS,
+                self.generation,
+            )
 
     def click_combine(self) -> None:
         # 上层只有在连续确认合成按钮为蓝色高亮时才会调用。
@@ -903,7 +955,6 @@ class Win32AutomationDriver:
     def wait_for_combination(self) -> None:
         self.status("等待合成动画完成，随后将再次自动填充")
         self.gate.interruptible_wait(self.combination_wait, self.generation)
-        self._save_grid_diagnostic("combine-wait-finished", None)
 
     def click_return_items(self) -> None:
         self._click("return_items")

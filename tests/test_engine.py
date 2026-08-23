@@ -13,11 +13,12 @@ from tbh_automation.engine import (
 
 
 class FakeDriver:
-    def __init__(self, observations: list[int], readiness: list[bool] | None = None) -> None:
-        self.observations = iter(observations)
-        self.readiness = iter(readiness) if readiness is not None else None
-        self.last_observation = 0
+    def __init__(self, readiness: list[bool]) -> None:
+        self.readiness = iter(readiness)
         self.actions: list[str] = []
+
+    def prepare_interface(self) -> None:
+        self.actions.append("prepare")
 
     def checkpoint(self) -> None:
         self.actions.append("checkpoint")
@@ -28,14 +29,8 @@ class FakeDriver:
     def click_auto_fill(self) -> None:
         self.actions.append("fill")
 
-    def observe_filled_cells(self) -> int:
-        value = next(self.observations)
-        self.last_observation = value
-        self.actions.append(f"observe:{value}")
-        return value
-
     def combine_button_is_enabled(self) -> bool:
-        value = next(self.readiness) if self.readiness is not None else self.last_observation == 9
+        value = next(self.readiness)
         self.actions.append(f"ready:{value}")
         return value
 
@@ -50,12 +45,13 @@ class FakeDriver:
 
 
 class SynthesisEngineTests(unittest.TestCase):
-    def test_full_grid_combines_and_only_equipment_and_material_are_selected(self) -> None:
-        driver = FakeDriver([9, 3, 2, 1, 0])
+    def test_blue_button_combines_and_only_equipment_and_material_are_selected(self) -> None:
+        driver = FakeDriver([True, False, False, False, False])
         result = SynthesisEngine(driver).run_round()
 
         self.assertEqual(result.equipment_combinations, 1)
         self.assertEqual(result.material_combinations, 0)
+        self.assertEqual(driver.actions.count("prepare"), 1)
         self.assertEqual(
             [action for action in driver.actions if action.startswith("select:")],
             ["select:装备", "select:材料"],
@@ -64,27 +60,23 @@ class SynthesisEngineTests(unittest.TestCase):
         self.assertEqual(driver.actions.count("combine"), 1)
         combine_index = driver.actions.index("combine")
         next_fill_index = driver.actions.index("fill", combine_index)
-        next_observe_index = next(
-            index
-            for index in range(next_fill_index + 1, len(driver.actions))
-            if driver.actions[index].startswith("observe:")
-        )
         self.assertLess(combine_index, next_fill_index)
-        self.assertLess(next_fill_index, next_observe_index)
+        self.assertEqual(driver.actions[next_fill_index + 1], "ready:False")
+        self.assertFalse(any(action.startswith("observe:") for action in driver.actions))
 
-    def test_first_underfull_then_retry_full_combines(self) -> None:
-        driver = FakeDriver([4, 9, 0, 0, 0, 0])
+    def test_first_grey_then_retry_blue_combines(self) -> None:
+        driver = FakeDriver([False, True, False, False, False, False])
         result = SynthesisEngine(driver).run_round()
 
         self.assertEqual(result.equipment_combinations, 1)
-        first_observe = driver.actions.index("observe:4")
-        retry_observe = driver.actions.index("observe:9")
-        between = driver.actions[first_observe:retry_observe]
+        first_check = driver.actions.index("ready:False")
+        retry_check = driver.actions.index("ready:True")
+        between = driver.actions[first_check:retry_check]
         self.assertIn("return", between)
         self.assertIn("fill", between)
 
-    def test_two_underfull_attempts_end_category_and_return_residue(self) -> None:
-        driver = FakeDriver([5, 5, 2, 2])
+    def test_two_grey_attempts_end_category_and_return_residue(self) -> None:
+        driver = FakeDriver([False, False, False, False])
         result = SynthesisEngine(driver).run_round()
 
         self.assertEqual(result.total, 0)
@@ -92,11 +84,8 @@ class SynthesisEngineTests(unittest.TestCase):
         self.assertEqual(driver.actions.count("return"), 5)
         self.assertEqual(driver.actions.count("fill"), 4)
 
-    def test_false_full_grid_never_clicks_a_grey_combine_button(self) -> None:
-        driver = FakeDriver(
-            [9, 9, 9, 9],
-            readiness=[False, False, False, False],
-        )
+    def test_grey_combine_button_is_never_clicked(self) -> None:
+        driver = FakeDriver([False, False, False, False])
 
         result = SynthesisEngine(driver).run_round()
 
@@ -104,19 +93,17 @@ class SynthesisEngineTests(unittest.TestCase):
         self.assertNotIn("combine", driver.actions)
         self.assertEqual(driver.actions.count("ready:False"), 4)
 
-    def test_blue_button_can_override_a_grid_undercount(self) -> None:
-        driver = FakeDriver(
-            [7, 0, 0, 0, 0],
-            readiness=[True, False, False, False, False],
-        )
+    def test_no_grid_observation_is_requested(self) -> None:
+        driver = FakeDriver([True, False, False, False, False])
 
         result = SynthesisEngine(driver).run_round()
 
         self.assertEqual(result.equipment_combinations, 1)
         self.assertEqual(driver.actions.count("combine"), 1)
+        self.assertFalse(hasattr(driver, "observe_filled_cells"))
 
     def test_safety_limit_stops_a_possible_infinite_loop(self) -> None:
-        driver = FakeDriver([9, 9])
+        driver = FakeDriver([True, True])
         engine = SynthesisEngine(driver, max_combinations_per_category=2)
         with self.assertRaises(AutomationError):
             engine.run_round()

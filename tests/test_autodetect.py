@@ -4,6 +4,7 @@ import unittest
 
 from tbh_automation.autodetect import (
     AUTO_FILL_MASK,
+    find_cube_icon,
     find_auto_fill_anchor,
     layout_points_from_anchor,
 )
@@ -14,7 +15,120 @@ def gray_bgra(value: int) -> bytes:
     return bytes((value, value, value, 255))
 
 
+def paint_rectangle(
+    image: bytearray,
+    width: int,
+    left: int,
+    top: int,
+    right: int,
+    bottom: int,
+    color: bytes,
+) -> None:
+    for y in range(top, bottom + 1):
+        for x in range(left, right + 1):
+            offset = (y * width + x) * 4
+            image[offset:offset + 4] = color
+
+
 class AutoDetectionTests(unittest.TestCase):
+    def test_finds_single_large_yellow_cube_icon_in_lower_half(self) -> None:
+        width, height = 400, 320
+        image = bytearray(gray_bgra(20) * (width * height))
+        paint_rectangle(image, width, 220, 200, 335, 315, bytes((10, 30, 70, 255)))
+        for y in range(230, 286):
+            for x in range(251, 307):
+                if x not in (251, 252, 305, 306) and y not in (230, 231, 284, 285):
+                    continue
+                offset = (y * width + x) * 4
+                image[offset:offset + 4] = bytes((20, 150, 220, 255))
+
+        result = find_cube_icon(bytes(image), width, height)
+
+        self.assertEqual(result.center, Point(278, 257))
+        self.assertEqual(result.bounds, (251, 230, 306, 285))
+
+    def test_multiple_cube_like_icons_are_rejected(self) -> None:
+        width, height = 400, 320
+        image = bytearray(gray_bgra(20) * (width * height))
+        for left in (80, 250):
+            paint_rectangle(
+                image,
+                width,
+                left - 25,
+                205,
+                left + 74,
+                304,
+                bytes((10, 30, 70, 255)),
+            )
+            for y in range(230, 280):
+                for x in range(left, left + 50):
+                    if x not in (left, left + 1, left + 48, left + 49) and y not in (230, 231, 278, 279):
+                        continue
+                    offset = (y * width + x) * 4
+                    image[offset:offset + 4] = bytes((20, 150, 220, 255))
+
+        with self.assertRaisesRegex(ValueError, "多个"):
+            find_cube_icon(bytes(image), width, height)
+
+    def test_finds_solid_cube_from_current_runtime_screenshot_style(self) -> None:
+        width, height = 400, 320
+        image = bytearray(gray_bgra(32) * (width * height))
+        paint_rectangle(image, width, 230, 195, 330, 305, bytes((10, 30, 70, 255)))
+        paint_rectangle(image, width, 261, 231, 299, 269, bytes((20, 150, 220, 255)))
+
+        result = find_cube_icon(bytes(image), width, height)
+
+        self.assertEqual(result.center, Point(280, 250))
+        self.assertEqual(result.bounds, (261, 231, 299, 269))
+
+    def test_uses_navigation_row_to_distinguish_cube_from_other_gold_icons(self) -> None:
+        width, height = 600, 400
+        image = bytearray(gray_bgra(32) * (width * height))
+        brown = bytes((10, 30, 70, 255))
+        yellow = bytes((20, 150, 220, 255))
+        for center_x in (100, 190, 280, 370):
+            paint_rectangle(
+                image,
+                width,
+                center_x - 45,
+                255,
+                center_x + 45,
+                345,
+                brown,
+            )
+        for center_x in (100, 190, 280):
+            paint_rectangle(
+                image,
+                width,
+                center_x - 15,
+                285,
+                center_x + 15,
+                315,
+                yellow,
+            )
+        # 魔方内部的深色线条会把黄色图案切成三块，单块都不满足候选尺寸。
+        paint_rectangle(image, width, 355, 282, 385, 293, yellow)
+        paint_rectangle(image, width, 354, 297, 367, 318, yellow)
+        paint_rectangle(image, width, 373, 297, 386, 318, yellow)
+
+        result = find_cube_icon(bytes(image), width, height)
+
+        self.assertEqual(result.center, Point(370, 300))
+        self.assertEqual(result.bounds, (354, 282, 386, 318))
+
+    def test_large_bottom_scene_icon_from_runtime_log_is_rejected(self) -> None:
+        width, height = 1455, 1338
+        image = bytearray(gray_bgra(20) * (width * height))
+        for y in range(1189, 1300):
+            for x in range(227, 306):
+                if (x + y) % 3:
+                    continue
+                offset = (y * width + x) * 4
+                image[offset:offset + 4] = bytes((20, 150, 220, 255))
+
+        with self.assertRaisesRegex(ValueError, "未识别"):
+            find_cube_icon(bytes(image), width, height)
+
     def test_finds_auto_fill_text_inside_larger_image(self) -> None:
         width, height = 180, 80
         anchor = Point(73, 31)
@@ -85,7 +199,7 @@ class AutoDetectionTests(unittest.TestCase):
                 offset = ((anchor.y + y) * width + anchor.x + x) * 4
                 image[offset:offset + 4] = gray_bgra(value)
 
-        with self.assertRaisesRegex(ValueError, "棕色"):
+        with self.assertRaises(ValueError):
             find_auto_fill_anchor(
                 bytes(image),
                 width,
@@ -110,8 +224,6 @@ class AutoDetectionTests(unittest.TestCase):
 
     def test_layout_points_match_recorded_cube_geometry(self) -> None:
         points = layout_points_from_anchor(Point(566, 407))
-        self.assertEqual(points["grid_top_left"], Point(605, 275))
-        self.assertEqual(points["grid_bottom_right"], Point(685, 355))
         self.assertEqual(points["auto_fill"], Point(595, 414))
         self.assertEqual(points["combine"], Point(718, 414))
         self.assertEqual(points["return_items"], Point(570, 362))

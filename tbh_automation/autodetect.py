@@ -45,6 +45,13 @@ class AutoDetectionResult:
         return 1.0 - self.mismatch_ratio
 
 
+@dataclass(frozen=True)
+class CubeIconDetectionResult:
+    center: Point
+    bounds: tuple[int, int, int, int]
+    yellow_pixels: int
+
+
 def _bgra_to_gray(image: bytes) -> bytes:
     gray = bytearray(len(image) // 4)
     target = 0
@@ -79,6 +86,7 @@ def _best_match_at_scale(
     width: int,
     height: int,
     scale: float,
+    brown_mask: bytes | None = None,
 ) -> tuple[Point | None, float]:
     mask_width, mask_height, samples = _scaled_samples(scale)
     if width < mask_width or height < mask_height:
@@ -98,6 +106,30 @@ def _best_match_at_scale(
     max_y = height - mask_height
     for y in range(max_y + 1):
         for x in range(max_x + 1):
+            if brown_mask is not None:
+                center_x = x + round(29 * scale)
+                center_y = y + round(7 * scale)
+                if (
+                    not (0 <= center_x < width and 0 <= center_y < height)
+                    or not brown_mask[center_y * width + center_x]
+                ):
+                    continue
+                brown_samples = 1
+                for delta_x, delta_y in (
+                    (-12, -5), (12, -5),
+                    (-12, 5), (12, 5),
+                    (-22, 0), (22, 0),
+                ):
+                    sample_x = center_x + round(delta_x * scale)
+                    sample_y = center_y + round(delta_y * scale)
+                    if (
+                        0 <= sample_x < width
+                        and 0 <= sample_y < height
+                        and brown_mask[sample_y * width + sample_x]
+                    ):
+                        brown_samples += 1
+                if brown_samples < 2:
+                    continue
             mismatches = 0
             for sample_x, sample_y, expected_on in prefilter:
                 actual_on = gray[(y + sample_y) * width + x + sample_x] >= GRAY_THRESHOLD
@@ -147,6 +179,244 @@ def _button_brown_ratio(
     return brown / total
 
 
+def _is_cube_yellow(blue: int, green: int, red: int) -> bool:
+    return (
+        red >= 150
+        and green >= 85
+        and blue <= 100
+        and red >= green + 20
+        and green >= blue + 25
+    )
+
+
+def _cube_button_brown_ratio(
+    image_bgra: bytes,
+    width: int,
+    height: int,
+    bounds: tuple[int, int, int, int],
+) -> float:
+    """计算黄色图案周围的深棕按钮底色比例。"""
+    component_width = bounds[2] - bounds[0] + 1
+    component_height = bounds[3] - bounds[1] + 1
+    margin = round(max(component_width, component_height) * 0.5)
+    left = max(0, bounds[0] - margin)
+    top = max(0, bounds[1] - margin)
+    right = min(width - 1, bounds[2] + margin)
+    bottom = min(height - 1, bounds[3] + margin)
+    brown = 0
+    total = 0
+    for y in range(top, bottom + 1):
+        for x in range(left, right + 1):
+            offset = (y * width + x) * 4
+            blue, green, red = image_bgra[offset : offset + 3]
+            if _is_cube_yellow(blue, green, red):
+                continue
+            total += 1
+            if red >= 35 and red >= green + 12 and green >= blue + 3:
+                brown += 1
+    return brown / total if total else 0.0
+
+
+def _infer_cube_from_navigation_row(
+    image_bgra: bytes,
+    width: int,
+    height: int,
+    candidates: list[CubeIconDetectionResult],
+) -> CubeIconDetectionResult | None:
+    """由底部前三个等距黄色功能图标推导第 4 个魔方入口。"""
+    ordered = sorted(candidates, key=lambda candidate: candidate.center.x)
+    hypotheses: list[tuple[float, CubeIconDetectionResult]] = []
+    y_tolerance = max(10, round(height * 0.025))
+    minimum_spacing = max(30, round(width * 0.05))
+    maximum_spacing = max(minimum_spacing, round(width * 0.25))
+
+    for first_index in range(len(ordered) - 2):
+        for second_index in range(first_index + 1, len(ordered) - 1):
+            for third_index in range(second_index + 1, len(ordered)):
+                first = ordered[first_index]
+                second = ordered[second_index]
+                third = ordered[third_index]
+                centers_y = (first.center.y, second.center.y, third.center.y)
+                if max(centers_y) - min(centers_y) > y_tolerance:
+                    continue
+                first_spacing = second.center.x - first.center.x
+                second_spacing = third.center.x - second.center.x
+                average_spacing = (first_spacing + second_spacing) / 2
+                if not minimum_spacing <= average_spacing <= maximum_spacing:
+                    continue
+                if abs(first_spacing - second_spacing) > average_spacing * 0.22:
+                    continue
+
+                predicted_x = third.center.x + round(average_spacing)
+                predicted_y = round(sum(centers_y) / 3)
+                radius = max(16, round(average_spacing * 0.32))
+                if (
+                    predicted_x - radius < 0
+                    or predicted_x + radius >= width
+                    or predicted_y - radius < 0
+                    or predicted_y + radius >= height
+                    or predicted_y > round(height * 0.88)
+                ):
+                    continue
+
+                yellow_points: list[tuple[int, int]] = []
+                for y in range(predicted_y - radius, predicted_y + radius + 1):
+                    row_offset = y * width * 4
+                    for x in range(predicted_x - radius, predicted_x + radius + 1):
+                        offset = row_offset + x * 4
+                        if _is_cube_yellow(
+                            image_bgra[offset],
+                            image_bgra[offset + 1],
+                            image_bgra[offset + 2],
+                        ):
+                            yellow_points.append((x, y))
+                if len(yellow_points) < 180:
+                    continue
+                left = min(point[0] for point in yellow_points)
+                top = min(point[1] for point in yellow_points)
+                right = max(point[0] for point in yellow_points)
+                bottom = max(point[1] for point in yellow_points)
+                bounds = (left, top, right, bottom)
+                component_width = right - left + 1
+                component_height = bottom - top + 1
+                aspect = component_width / component_height
+                yellow_center = Point((left + right) // 2, (top + bottom) // 2)
+                if (
+                    not 0.65 <= aspect <= 1.4
+                    or abs(yellow_center.x - predicted_x) > radius * 0.30
+                    or abs(yellow_center.y - predicted_y) > radius * 0.30
+                    or _cube_button_brown_ratio(
+                        image_bgra,
+                        width,
+                        height,
+                        bounds,
+                    ) < 0.25
+                ):
+                    continue
+                regularity = abs(first_spacing - second_spacing) / average_spacing
+                hypotheses.append(
+                    (
+                        regularity,
+                        CubeIconDetectionResult(
+                            center=yellow_center,
+                            bounds=bounds,
+                            yellow_pixels=len(yellow_points),
+                        ),
+                    )
+                )
+
+    if not hypotheses:
+        return None
+    hypotheses.sort(key=lambda hypothesis: hypothesis[0])
+    best = hypotheses[0][1]
+    if any(
+        abs(candidate.center.x - best.center.x) > 5
+        or abs(candidate.center.y - best.center.y) > 5
+        for _score, candidate in hypotheses[1:]
+    ):
+        return None
+    return best
+
+
+def find_cube_icon(image_bgra: bytes, width: int, height: int) -> CubeIconDetectionResult:
+    """识别英雄背包底部唯一的大块黄色魔方图标。"""
+    if len(image_bgra) != width * height * 4:
+        raise ValueError("魔方入口截图尺寸不正确")
+    if width < 250 or height < 250:
+        raise ValueError("游戏窗口太小，无法识别魔方入口")
+
+    # 魔方入口位于英雄菜单下半部分。先提取高饱和黄色像素，再用连通区域
+    # 排除金币文字、细边框和其他较小图标。
+    remaining: set[tuple[int, int]] = set()
+    for y in range(round(height * 0.45), height):
+        row_offset = y * width * 4
+        for x in range(width):
+            offset = row_offset + x * 4
+            if _is_cube_yellow(
+                image_bgra[offset],
+                image_bgra[offset + 1],
+                image_bgra[offset + 2],
+            ):
+                remaining.add((x, y))
+
+    candidates: list[CubeIconDetectionResult] = []
+    neighbours = (
+        (-1, -1), (0, -1), (1, -1),
+        (-1, 0), (1, 0),
+        (-1, 1), (0, 1), (1, 1),
+    )
+    while remaining:
+        seed = remaining.pop()
+        stack = [seed]
+        count = 1
+        left = right = seed[0]
+        top = bottom = seed[1]
+        while stack:
+            x, y = stack.pop()
+            for delta_x, delta_y in neighbours:
+                adjacent = (x + delta_x, y + delta_y)
+                if adjacent not in remaining:
+                    continue
+                remaining.remove(adjacent)
+                stack.append(adjacent)
+                count += 1
+                left = min(left, adjacent[0])
+                right = max(right, adjacent[0])
+                top = min(top, adjacent[1])
+                bottom = max(bottom, adjacent[1])
+
+        component_width = right - left + 1
+        component_height = bottom - top + 1
+        aspect = component_width / component_height
+        density = count / (component_width * component_height)
+        outline_style = (
+            count >= 200
+            and 40 <= component_width <= 120
+            and 40 <= component_height <= 120
+            and 0.65 <= aspect <= 1.4
+            and density <= 0.24
+        )
+        solid_style = (
+            count >= 180
+            and 24 <= component_width <= 80
+            and 24 <= component_height <= 80
+            and 0.75 <= aspect <= 1.3
+            and density >= 0.30
+        )
+        bounds = (left, top, right, bottom)
+        if (
+            (outline_style or solid_style)
+            and (top + bottom) // 2 <= round(height * 0.88)
+            and _cube_button_brown_ratio(
+                image_bgra,
+                width,
+                height,
+                bounds,
+            ) >= 0.25
+        ):
+            candidates.append(
+                CubeIconDetectionResult(
+                    center=Point((left + right) // 2, (top + bottom) // 2),
+                    bounds=bounds,
+                    yellow_pixels=count,
+                )
+            )
+
+    if len(candidates) == 1:
+        return candidates[0]
+    inferred = _infer_cube_from_navigation_row(
+        image_bgra,
+        width,
+        height,
+        candidates,
+    )
+    if inferred is not None:
+        return inferred
+    if not candidates:
+        raise ValueError("未识别到英雄背包底部的黄色魔方入口")
+    raise ValueError("识别到多个相似的黄色图标，无法安全确定魔方入口")
+
+
 def find_auto_fill_anchor(
     image_bgra: bytes,
     width: int,
@@ -161,6 +431,17 @@ def find_auto_fill_anchor(
         raise ValueError("前台窗口太小，未找到魔方面板")
 
     gray = _bgra_to_gray(image_bgra)
+    brown_mask: bytes | None = None
+    if require_button_color:
+        mask = bytearray(width * height)
+        target = 0
+        for source in range(0, len(image_bgra), 4):
+            blue, green, red = image_bgra[source : source + 3]
+            mask[target] = int(
+                red >= 55 and red >= green + 12 and green >= blue + 4
+            )
+            target += 1
+        brown_mask = bytes(mask)
     best_point: Point | None = None
     best_ratio = 1.0
     best_scale = 1.0
@@ -170,7 +451,13 @@ def find_auto_fill_anchor(
         # 强时可立即结束；其他比例仍保留为游戏自身 UI 缩放的回退。
         scales = tuple(sorted(SUPPORTED_SCALES, key=lambda value: abs(value - preferred_scale)))
     for index, scale in enumerate(scales):
-        point, ratio = _best_match_at_scale(gray, width, height, scale)
+        point, ratio = _best_match_at_scale(
+            gray,
+            width,
+            height,
+            scale,
+            brown_mask,
+        )
         if point is not None and ratio < best_ratio:
             best_point = point
             best_ratio = ratio
@@ -204,8 +491,6 @@ def find_auto_fill_anchor(
 def layout_points_from_anchor(anchor: Point, scale: float = 1.0) -> dict[str, Point]:
     """从文字锚点推导当前固定魔方面板中的所有操作位置。"""
     offsets = {
-        "grid_top_left": (39, -132),
-        "grid_bottom_right": (119, -52),
         "auto_fill": (29, 7),
         "category_dropdown": (84, 7),
         "category_equipment": (28, 41),

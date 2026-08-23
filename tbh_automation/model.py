@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import base64
 import json
 import logging
 import os
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +13,7 @@ LOG = logging.getLogger("tbh_automation.model")
 
 
 class StaleCalibrationError(ValueError):
-    """校准格式过期或基准明显被其他窗口污染。"""
+    """校准格式已经过期。"""
 
 
 def default_app_dir() -> Path:
@@ -45,14 +44,9 @@ class WindowIdentity:
 class Calibration:
     window: WindowIdentity
     points: dict[str, Point]
-    empty_grid_patches: list[str]
-    calibration_version: int = 8
-    patch_size: int = 32
-    difference_threshold: float = 15.0
+    calibration_version: int = 9
 
     REQUIRED_POINTS = {
-        "grid_top_left",
-        "grid_bottom_right",
         "auto_fill",
         "category_dropdown",
         "category_equipment",
@@ -62,37 +56,29 @@ class Calibration:
     }
 
     def validate(self) -> None:
-        if self.calibration_version != 8:
-            raise StaleCalibrationError("旧版截图基准已失效，请重新自动识别或手动校准")
+        if self.calibration_version != 9:
+            raise StaleCalibrationError("旧版位置校准已失效，请重新自动识别或手动校准")
         missing = self.REQUIRED_POINTS.difference(self.points)
         if missing:
             raise ValueError(f"校准配置缺少位置：{', '.join(sorted(missing))}")
-        if len(self.empty_grid_patches) != 9:
-            raise ValueError("空九宫格基准必须恰好包含 9 个采样块")
-        decoded_patches = [base64_decode(value) for value in self.empty_grid_patches]
-        expected_patch_bytes = self.patch_size * self.patch_size * 4
-        if all(len(patch) == expected_patch_bytes for patch in decoded_patches):
-            colorful_pixels = sum(
-                max(patch[index : index + 3]) - min(patch[index : index + 3]) >= 4
-                for patch in decoded_patches
-                for index in range(0, len(patch), 4)
-            )
-            if colorful_pixels == 0:
-                raise StaleCalibrationError(
-                    "空九宫格基准为纯灰阶画面，疑似采到了终端窗口，请重新校准"
-                )
         if self.window.client_width <= 0 or self.window.client_height <= 0:
             raise ValueError("游戏窗口尺寸无效")
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "Calibration":
+        version = int(value.get("calibration_version", 0))
+        if version not in (8, 9):
+            raise StaleCalibrationError("旧版位置校准已失效，请重新自动识别或手动校准")
         result = cls(
             window=WindowIdentity(**value["window"]),
-            points={key: Point.from_dict(point) for key, point in value["points"].items()},
-            empty_grid_patches=list(value["empty_grid_patches"]),
-            calibration_version=int(value.get("calibration_version", 0)),
-            patch_size=int(value.get("patch_size", 32)),
-            difference_threshold=float(value.get("difference_threshold", 15.0)),
+            points={
+                key: Point.from_dict(value["points"][key])
+                for key in cls.REQUIRED_POINTS
+                if key in value["points"]
+            },
+            # 0.3.x 的第 8 版校准已经包含所有按钮坐标，可直接迁移；旧的
+            # 九宫格采样字段会被忽略，不要求用户重新校准。
+            calibration_version=9,
         )
         result.validate()
         return result
@@ -106,7 +92,7 @@ class AppConfig:
     click_delay_seconds: float = 0.35
     action_timeout_seconds: float = 12.0
     combination_wait_seconds: float = 2.5
-    version: int = 5
+    version: int = 6
 
     @classmethod
     def load(cls, path: Path | None = None) -> "AppConfig":
@@ -116,9 +102,13 @@ class AppConfig:
         raw = json.loads(config_path.read_text(encoding="utf-8"))
         calibration_raw = raw.pop("calibration", None)
         config = cls(**raw)
+        config.version = 6
         if calibration_raw is not None:
             try:
                 config.calibration = Calibration.from_dict(calibration_raw)
+                if int(calibration_raw.get("calibration_version", 0)) == 8:
+                    LOG.info("已迁移旧版校准：删除九宫格基准，仅保留按钮位置")
+                    config.save(config_path)
             except StaleCalibrationError as error:
                 # 版本升级属于正常迁移：只清除校准，保留间隔等其他设置，且
                 # 立即写回，避免每次启动重复打印同一个异常堆栈。
@@ -137,10 +127,3 @@ class AppConfig:
         )
         temp_path.replace(config_path)
         return config_path
-
-
-def base64_decode(value: str) -> bytes:
-    try:
-        return base64.b64decode(value, validate=True)
-    except (ValueError, TypeError) as error:
-        raise ValueError("空九宫格基准编码损坏") from error

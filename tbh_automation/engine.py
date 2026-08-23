@@ -43,13 +43,13 @@ class RunSchedule:
 
 
 class AutomationDriver(Protocol):
+    def prepare_interface(self) -> None: ...
+
     def checkpoint(self) -> None: ...
 
     def select_category(self, category: Category) -> None: ...
 
     def click_auto_fill(self) -> None: ...
-
-    def observe_filled_cells(self) -> int: ...
 
     def combine_button_is_enabled(self) -> bool: ...
 
@@ -87,8 +87,10 @@ class SynthesisEngine:
         self.status = status or (lambda _message: None)
 
     def run_round(self) -> RoundResult:
-        # 清理上次暂停或异常时可能留在九宫格中的物品。
-        self.status("正在准备合成")
+        # 自动找到游戏，并在需要时打开英雄背包与魔方合成窗口。
+        self.status("正在查找游戏并准备合成界面")
+        self.driver.prepare_interface()
+        # 清理上次暂停或异常时可能留在合成区域中的物品。
         self.driver.checkpoint()
         self.driver.click_return_items()
         counts: dict[Category, int] = {}
@@ -111,54 +113,37 @@ class SynthesisEngine:
             self.driver.checkpoint()
             self.status(f"{category.value}：正在自动填充")
             self.driver.click_auto_fill()
-            filled = self.driver.observe_filled_cells()
             combine_ready = self.driver.combine_button_is_enabled()
             self.log.info(
-                "%s首次填充：%d/9，合成按钮=%s",
+                "%s首次填充：合成按钮=%s",
                 category.value,
-                filled,
                 "蓝色可用" if combine_ready else "灰色不可用",
             )
 
-            # 按钮是否高亮是游戏自身给出的最终状态。九宫格识别可能因普通品质
-            # 图标或屏幕遮挡而误报，因此它只作为诊断信息，不单独授权点击。
+            # 是否合成只服从游戏自身的按钮状态，不再读取九宫格画面。
             if combine_ready:
-                self._combine_full_grid(category, combinations + 1)
+                self._combine(category, combinations + 1)
                 combinations += 1
                 continue
 
-            if filled == 9:
-                self.log.warning(
-                    "%s九宫格识别为 9/9，但合成按钮未高亮；已禁止点击并执行复核",
-                    category.value,
-                )
-
-            # 第一次不足九格：全部退回后再次填充，以排除界面瞬态或残留。
+            # 第一次按钮一直未激活：全部退回后再次填充，以排除界面瞬态或残留。
             self.status(f"{category.value}：合成按钮不可用，退回后复核")
             self.driver.click_return_items()
             self.driver.checkpoint()
             self.driver.click_auto_fill()
-            retry_filled = self.driver.observe_filled_cells()
             retry_ready = self.driver.combine_button_is_enabled()
             self.log.info(
-                "%s复核填充：%d/9，合成按钮=%s",
+                "%s复核填充：合成按钮=%s",
                 category.value,
-                retry_filled,
                 "蓝色可用" if retry_ready else "灰色不可用",
             )
 
             if retry_ready:
-                self._combine_full_grid(category, combinations + 1)
+                self._combine(category, combinations + 1)
                 combinations += 1
                 continue
 
-            if retry_filled == 9:
-                self.log.warning(
-                    "%s复核仍识别为 9/9，但合成按钮未高亮；已禁止点击并结束该类别",
-                    category.value,
-                )
-
-            # 第二次仍不足时也退回，避免残留物品影响下一类别。
+            # 第二次按钮仍未激活时也退回，避免残留物品影响下一类别。
             self.driver.click_return_items()
             self.status(f"{category.value}已全部处理")
             return combinations
@@ -167,12 +152,11 @@ class SynthesisEngine:
             f"{category.value}单轮已达到安全上限 {self.max_combinations} 次，已暂停以防止死循环"
         )
 
-    def _combine_full_grid(self, category: Category, sequence: int) -> None:
+    def _combine(self, category: Category, sequence: int) -> None:
         self.driver.checkpoint()
         self.status(f"{category.value}：合成按钮已高亮，正在合成（第 {sequence} 次）")
         self.driver.click_combine()
-        # 游戏合成后九宫格画面不一定清空，不能用格子数量确认完成。等待动画后
-        # 直接回到循环，由下一次“自动填充”产生新状态，再进行识别。
+        # 等待合成动画后直接回到循环；下一次自动填充只检查按钮是否激活。
         self.driver.wait_for_combination()
 
 

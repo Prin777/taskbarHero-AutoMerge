@@ -2,19 +2,11 @@ from __future__ import annotations
 
 import unittest
 
-import base64
-
 from tbh_automation.app import (
     CALIBRATION_STEPS,
     calibration_step_or_finish,
-    manual_grid_baseline_is_acceptable,
     scaled_pixels,
 )
-
-
-def uniform_patch(gray: int) -> str:
-    pixels = bytes((gray, gray, gray, 255)) * (16 * 16)
-    return base64.b64encode(pixels).decode("ascii")
 
 
 class CalibrationFlowTests(unittest.TestCase):
@@ -27,9 +19,11 @@ class CalibrationFlowTests(unittest.TestCase):
         self.assertEqual(action, "finish")
         self.assertIsNone(step)
 
-    def test_manual_empty_baseline_accepts_normal_background_variation(self) -> None:
-        patches = [uniform_patch(gray) for gray in (20, 25, 30, 35, 40, 45, 50, 55, 60)]
-        self.assertTrue(manual_grid_baseline_is_acceptable(patches))
+    def test_manual_calibration_only_requests_button_positions(self) -> None:
+        keys = {step.key for step in CALIBRATION_STEPS}
+        self.assertNotIn("grid_top_left", keys)
+        self.assertNotIn("grid_bottom_right", keys)
+        self.assertEqual(len(CALIBRATION_STEPS), 6)
 
 
 if __name__ == "__main__":

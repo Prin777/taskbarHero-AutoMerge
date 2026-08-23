@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import base64
 import queue
 import threading
 import time
@@ -19,21 +18,19 @@ DPI_AWARENESS = enable_per_monitor_dpi_awareness()
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-from .autodetect import find_auto_fill_anchor, layout_points_from_anchor
+from .autodetect import layout_points_from_anchor
 from .engine import AutomationError, ControlGate, RoundCancelled, RunSchedule, SynthesisEngine
 from .model import AppConfig, Calibration, Point, WindowIdentity, default_app_dir
 from .windows import (
     GlobalHotkeyListener,
     Win32AutomationDriver,
-    capture_client_bgra,
     cursor_capture,
     cursor_point_for_window,
     describe_window,
-    encode_empty_grid,
-    get_foreground_root,
     get_window_dpi,
+    find_taskbar_hero_window,
+    open_synthesis_interface,
     save_bgra_bmp,
-    temporarily_uncover_window,
 )
 
 
@@ -76,8 +73,6 @@ class CalibrationStep:
 
 
 CALIBRATION_STEPS = [
-    CalibrationStep("grid_top_left", "九宫格左上格", "确保九宫格完全为空，把鼠标放在左上格正中心，然后按 F7。"),
-    CalibrationStep("grid_bottom_right", "九宫格右下格", "把鼠标放在右下格正中心，然后按 F7。"),
     CalibrationStep("auto_fill", "自动填充按钮", "把鼠标放在“自动填充”按钮中央，然后按 F7。"),
     CalibrationStep("category_dropdown", "类别下拉箭头", "把鼠标放在“自动填充”右侧的小箭头上，然后按 F7。"),
     CalibrationStep("category_equipment", "装备菜单项", "手动点开类别菜单，把鼠标放在“装备”这一项中央，然后按 F7。"),
@@ -91,17 +86,6 @@ def calibration_step_or_finish(index: int) -> tuple[str, CalibrationStep | None]
     if index >= len(CALIBRATION_STEPS):
         return "finish", None
     return "capture", CALIBRATION_STEPS[index]
-
-
-def manual_grid_baseline_is_acceptable(encoded_patches: list[str]) -> bool:
-    """验证九个手动采样存在且尺寸一致，不猜测游戏背景是否相似。"""
-    if len(encoded_patches) != 9:
-        return False
-    try:
-        decoded = [base64.b64decode(value, validate=True) for value in encoded_patches]
-    except (ValueError, TypeError):
-        return False
-    return bool(decoded[0]) and len({len(patch) for patch in decoded}) == 1
 
 
 class TaskbarHeroApp:
@@ -223,7 +207,7 @@ class TaskbarHeroApp:
         ttk.Separator(outer).pack(fill="x", pady=self._px(12))
         ttk.Label(
             outer,
-            text="F8 开启/暂停　　F9 紧急停止\n仅当游戏窗口位于前台时才会操作鼠标",
+            text="F8 开启/暂停　　F9 紧急停止\n到期后会自动查找游戏并打开背包与魔方",
             anchor="center",
             justify="center",
         ).pack(fill="x")
@@ -254,7 +238,7 @@ class TaskbarHeroApp:
                 kind, payload = self.ui_queue.get_nowait()
                 if kind == "status":
                     detail = str(payload)
-                    if detail.startswith("等待游戏窗口"):
+                    if detail.startswith("等待 TaskBarHero"):
                         self._set_status("等待游戏", detail, "#b7791f")
                     else:
                         self._set_status("托管中", detail, "#137333")
@@ -279,7 +263,7 @@ class TaskbarHeroApp:
         else:
             remaining = max(0, round(self.schedule.next_due - time.monotonic()))
             if remaining == 0:
-                self.countdown_var.set("下一轮：已到时间，等待游戏位于前台")
+                self.countdown_var.set("下一轮：已到时间，正在等待游戏启动")
             else:
                 duration = str(timedelta(seconds=remaining))
                 self.countdown_var.set(f"下一轮倒计时：{duration}")
@@ -343,7 +327,7 @@ class TaskbarHeroApp:
         enabled = self.gate.toggle()
         if enabled:
             self.toggle_button.configure(text="暂停托管 (F8)")
-            self._set_status("托管中", "已开启；到期后等待游戏位于前台", "#137333")
+            self._set_status("托管中", "已开启；到期后将自动查找并激活游戏", "#137333")
         else:
             self.toggle_button.configure(text="开启托管 (F8)")
             self._set_status("已暂停", "不会执行任何鼠标操作", "#666666")
@@ -363,7 +347,7 @@ class TaskbarHeroApp:
         self.run_now_event.set()
         self.schedule.run_now(time.monotonic())
         self.toggle_button.configure(text="暂停托管 (F8)")
-        self._set_status("托管中", "将立即执行；请把游戏窗口切到前台", "#137333")
+        self._set_status("托管中", "将立即自动查找游戏并准备合成界面", "#137333")
 
     def start_auto_detection(self) -> None:
         if self._auto_detecting:
@@ -373,8 +357,9 @@ class TaskbarHeroApp:
             return
         proceed = messagebox.askokcancel(
             "自动识别位置",
-            "请先打开游戏的背包和魔方合成界面，并确保九宫格完全为空。\n\n"
-            "点击“确定”后，本工具会隐藏。请在 3 秒内点击游戏，使游戏位于前台。",
+            "请确保 TaskBarHero 游戏正在运行。\n\n"
+            "点击“确定”后，本工具会自动找到游戏，必要时打开英雄背包和魔方合成窗口，"
+            "然后识别并保存全部按钮位置。",
             parent=self.root,
         )
         if not proceed:
@@ -383,9 +368,9 @@ class TaskbarHeroApp:
             return
         self.gate.pause(cancel_round=True)
         self._auto_detecting = True
-        self._set_status("正在自动识别", "请在 3 秒内点击游戏窗口", "#b7791f")
+        self._set_status("正在自动识别", "正在查找游戏并准备背包与魔方窗口", "#b7791f")
         self.root.withdraw()
-        self.root.after(3000, self._perform_auto_detection)
+        self.root.after(500, self._perform_auto_detection)
 
     def _perform_auto_detection(self) -> None:
         previous_calibration = self.config.calibration
@@ -393,37 +378,28 @@ class TaskbarHeroApp:
         width = 0
         height = 0
         try:
-            hwnd = get_foreground_root()
+            preferred_identity = (
+                previous_calibration.window if previous_calibration is not None else None
+            )
+            hwnd = find_taskbar_hero_window(preferred_identity)
             if not hwnd:
-                raise ValueError("没有找到前台窗口")
+                raise ValueError("未找到正在运行的 TaskBarHero.exe，请先启动游戏")
             identity = describe_window(hwnd)
-            with temporarily_uncover_window(hwnd, report_obstruction=True):
-                image, width, height = capture_client_bgra(hwnd)
-                window_dpi = get_window_dpi(hwnd)
-                LOG.info(
-                    "自动识别截图：window=%r process=%r client=%dx%d dpi=%d scale=%.2f",
-                    identity.title,
-                    identity.process_name,
-                    width,
-                    height,
-                    window_dpi,
-                    window_dpi / 96,
-                )
-                result = find_auto_fill_anchor(
-                    image,
-                    width,
-                    height,
-                    preferred_scale=window_dpi / 96,
-                    require_button_color=True,
-                )
-                calibration = Calibration(
-                    window=identity,
-                    points=layout_points_from_anchor(result.anchor, result.scale),
-                    empty_grid_patches=[""] * 9,
-                )
-                calibration.empty_grid_patches = encode_empty_grid(hwnd, calibration)
-            if not manual_grid_baseline_is_acceptable(calibration.empty_grid_patches):
-                raise ValueError("无法完整采集九宫格基准，请使用手动校准")
+            image, width, height, result = open_synthesis_interface(hwnd)
+            window_dpi = get_window_dpi(hwnd)
+            LOG.info(
+                "自动识别截图：window=%r process=%r client=%dx%d dpi=%d scale=%.2f",
+                identity.title,
+                identity.process_name,
+                width,
+                height,
+                window_dpi,
+                window_dpi / 96,
+            )
+            calibration = Calibration(
+                window=identity,
+                points=layout_points_from_anchor(result.anchor, result.scale),
+            )
             calibration.validate()
             self.config.calibration = calibration
             self.config.save()
@@ -466,8 +442,8 @@ class TaskbarHeroApp:
         self.gate.enable()
         self.run_now_event.set()
         self.toggle_button.configure(text="暂停托管 (F8)")
-        self._set_status("识别完成", "请保持游戏位于前台，将立即执行第一轮", "#137333")
-        messagebox.showinfo("自动识别完成", "位置和空九宫格基准已保存，将立即执行第一轮。", parent=self.root)
+        self._set_status("识别完成", "游戏与全部按钮位置已识别，将立即执行第一轮", "#137333")
+        messagebox.showinfo("自动识别完成", "全部按钮位置已保存，将立即执行第一轮。", parent=self.root)
 
     def start_calibration(self) -> None:
         if self._wizard is not None and self._wizard.winfo_exists():
@@ -582,17 +558,12 @@ class TaskbarHeroApp:
             calibration = Calibration(
                 window=self._calibration_identity,
                 points=dict(self._calibration_points),
-                empty_grid_patches=[""] * 9,
             )
-            with temporarily_uncover_window(self._calibration_hwnd, report_obstruction=True):
-                calibration.empty_grid_patches = encode_empty_grid(self._calibration_hwnd, calibration)
-            if not manual_grid_baseline_is_acceptable(calibration.empty_grid_patches):
-                raise ValueError("九宫格看起来并非完全为空，请清空后重新校准")
             calibration.validate()
             self.config.calibration = calibration
             self.config.save()
         except Exception:
-            LOG.exception("手动校准最终截图失败，未保存无效基准")
+            LOG.exception("手动校准保存失败")
             self.root.deiconify()
             self._wizard.deiconify()
             raise
@@ -603,8 +574,8 @@ class TaskbarHeroApp:
         self.gate.enable()
         self.run_now_event.set()
         self.toggle_button.configure(text="暂停托管 (F8)")
-        self._set_status("校准完成", "请把游戏窗口切到前台，将立即执行第一轮", "#137333")
-        messagebox.showinfo("校准完成", "配置已保存。请把游戏窗口切到前台，程序会立即执行第一轮。", parent=self.root)
+        self._set_status("校准完成", "配置已保存，将立即自动准备游戏界面", "#137333")
+        messagebox.showinfo("校准完成", "配置已保存，程序会自动找到游戏并执行第一轮。", parent=self.root)
 
     def _cancel_calibration(self) -> None:
         if self._wizard is not None:

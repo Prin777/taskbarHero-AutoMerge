@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import json
 import tempfile
 import unittest
@@ -11,12 +10,10 @@ from tbh_automation.model import AppConfig, Calibration, Point, WindowIdentity
 from tbh_automation.windows import (
     Win32AutomationDriver,
     blue_highlight_ratio,
-    count_filled_cells,
     crop_bgra,
-    grid_centers,
     image_has_visual_content,
-    mean_absolute_difference,
-    salient_pixel_difference,
+    is_taskbar_hero_identity,
+    point_is_safe_on_active_game,
 )
 
 
@@ -25,44 +22,56 @@ def pixel(blue: int, green: int, red: int) -> bytes:
 
 
 class VisionTests(unittest.TestCase):
-    def test_grid_centers_are_interpolated_in_row_major_order(self) -> None:
-        calibration = Calibration(
-            window=WindowIdentity(client_width=800, client_height=700),
-            points={
-                **{key: Point(0, 0) for key in Calibration.REQUIRED_POINTS},
-                "grid_top_left": Point(100, 200),
-                "grid_bottom_right": Point(200, 300),
-            },
-            empty_grid_patches=[base64.b64encode(b"x").decode()] * 9,
+    def test_transparent_game_can_report_the_normal_window_underneath(self) -> None:
+        with (
+            patch("tbh_automation.windows.point_is_visible_on_window", return_value=False),
+            patch("tbh_automation.windows.get_foreground_root", return_value=100),
+            patch("tbh_automation.windows._root_window", side_effect=lambda hwnd: hwnd),
+            patch("tbh_automation.windows._window_at_screen_point", return_value=200),
+            patch("tbh_automation.windows._screen_point_is_inside_client", return_value=True),
+            patch(
+                "tbh_automation.windows._window_is_topmost",
+                side_effect=lambda hwnd: hwnd == 100,
+            ),
+            patch("tbh_automation.windows.get_process_name", return_value="explorer.exe"),
+            patch("tbh_automation.windows.get_window_title", return_value="Explorer"),
+            patch("tbh_automation.windows.get_class_name", return_value="CabinetWClass"),
+        ):
+            self.assertTrue(point_is_safe_on_active_game(100, Point(500, 700)))
+
+    def test_a_different_topmost_window_still_blocks_the_click(self) -> None:
+        with (
+            patch("tbh_automation.windows.point_is_visible_on_window", return_value=False),
+            patch("tbh_automation.windows.get_foreground_root", return_value=100),
+            patch("tbh_automation.windows._root_window", side_effect=lambda hwnd: hwnd),
+            patch("tbh_automation.windows._window_at_screen_point", return_value=200),
+            patch("tbh_automation.windows._screen_point_is_inside_client", return_value=True),
+            patch("tbh_automation.windows._window_is_topmost", return_value=True),
+            patch("tbh_automation.windows.get_process_name", return_value="overlay.exe"),
+        ):
+            self.assertFalse(point_is_safe_on_active_game(100, Point(500, 700)))
+
+    def test_game_identity_requires_exact_process_and_unity_window_class(self) -> None:
+        self.assertTrue(
+            is_taskbar_hero_identity(
+                WindowIdentity(
+                    process_name="TaskBarHero.exe",
+                    class_name="UnityWndClass",
+                    client_width=1455,
+                    client_height=1338,
+                )
+            )
         )
-        self.assertEqual(
-            grid_centers(calibration),
-            [
-                Point(100, 200), Point(150, 200), Point(200, 200),
-                Point(100, 250), Point(150, 250), Point(200, 250),
-                Point(100, 300), Point(150, 300), Point(200, 300),
-            ],
+        self.assertFalse(
+            is_taskbar_hero_identity(
+                WindowIdentity(
+                    process_name="Terminal.exe",
+                    class_name="UnityWndClass",
+                    client_width=1455,
+                    client_height=1338,
+                )
+            )
         )
-
-    def test_image_difference_ignores_alpha_channel(self) -> None:
-        self.assertEqual(mean_absolute_difference(bytes((10, 20, 30, 0)), bytes((10, 20, 30, 255))), 0)
-        self.assertEqual(mean_absolute_difference(pixel(0, 0, 0), pixel(30, 30, 30)), 30)
-
-    def test_sparse_ordinary_item_details_are_detected_by_salient_pixels(self) -> None:
-        empty = pixel(12, 12, 12) * 16
-        ordinary_item = pixel(102, 102, 102) * 2 + pixel(12, 12, 12) * 14
-
-        self.assertLess(mean_absolute_difference(empty, ordinary_item), 15)
-        self.assertGreater(salient_pixel_difference(empty, ordinary_item), 15)
-
-    def test_low_contrast_items_still_count_as_a_full_grid(self) -> None:
-        threshold = Calibration(
-            window=WindowIdentity(client_width=800, client_height=700),
-            points={key: Point(10, 20) for key in Calibration.REQUIRED_POINTS},
-            empty_grid_patches=[base64.b64encode(b"abcd").decode()] * 9,
-        ).difference_threshold
-        differences = [18.0, 21.0, 35.0, 19.0, 24.0, 31.0, 17.0, 28.0, 20.0]
-        self.assertEqual(count_filled_cells(differences, threshold), 9)
 
     def test_blue_combine_button_is_distinguished_from_grey(self) -> None:
         blue_button = pixel(73, 60, 21) * 70 + pixel(50, 50, 50) * 30
@@ -96,40 +105,51 @@ class FakeTimedGate:
         self.now += seconds
 
 
-def timed_driver(observations, *, combination_wait: float = 2.5):
+def timed_driver(button_ratios=(), *, combination_wait: float = 2.5):
     driver = object.__new__(Win32AutomationDriver)
     gate = FakeTimedGate()
     driver.gate = gate
     driver.generation = 0
     driver.combination_wait = combination_wait
     driver.status = lambda _message: None
-    iterator = iter(observations)
-    driver._filled_count_once = lambda: next(iterator)
+    driver.diagnostics_dir = None
+    driver._diagnostic_index = 0
+    iterator = iter(button_ratios)
+    sample = pixel(50, 50, 50) * (32 * 32)
+    driver._combine_button_ratio_once = lambda: (next(iterator), sample)
     return driver, gate
 
 
 class TimedVisionFlowTests(unittest.TestCase):
-    def test_brief_full_grid_during_fill_animation_is_not_accepted(self) -> None:
-        # 9/9 持续不足 2.5 秒后又变为 8/9，应继续观察并接受稳定的 8/9。
-        driver, gate = timed_driver([9] * 8 + [8] * 3)
+    def test_grey_button_can_become_blue_during_fill_animation(self) -> None:
+        driver, gate = timed_driver([0.0, 0.30, 0.32])
 
         with patch("tbh_automation.windows.time.monotonic", side_effect=lambda: gate.now):
-            result = driver.observe_filled_cells()
+            result = driver.combine_button_is_enabled()
 
-        self.assertEqual(result, 8)
+        self.assertTrue(result)
+        self.assertGreaterEqual(gate.now, 1.05)
 
-    def test_full_grid_is_accepted_after_a_long_stable_window(self) -> None:
-        observations = [9] * 20
-        driver, gate = timed_driver(observations)
+    def test_permanently_grey_button_times_out_as_unavailable(self) -> None:
+        driver, gate = timed_driver([0.0] * 20)
 
         with patch("tbh_automation.windows.time.monotonic", side_effect=lambda: gate.now):
-            result = driver.observe_filled_cells()
+            result = driver.combine_button_is_enabled()
 
-        self.assertEqual(result, 9)
-        self.assertGreaterEqual(gate.now, 3.15)
+        self.assertFalse(result)
+        self.assertGreaterEqual(gate.now, 3.65)
 
-    def test_combination_wait_does_not_reinspect_the_grid(self) -> None:
-        driver, gate = timed_driver([], combination_wait=2.5)
+    def test_blue_button_requires_two_consecutive_confirmations(self) -> None:
+        driver, gate = timed_driver([0.30, 0.0, 0.31, 0.32])
+
+        with patch("tbh_automation.windows.time.monotonic", side_effect=lambda: gate.now):
+            result = driver.combine_button_is_enabled()
+
+        self.assertTrue(result)
+        self.assertGreaterEqual(gate.now, 1.25)
+
+    def test_combination_wait_only_waits_for_the_animation(self) -> None:
+        driver, gate = timed_driver(combination_wait=2.5)
 
         driver.wait_for_combination()
 
@@ -144,7 +164,6 @@ class ConfigTests(unittest.TestCase):
         calibration = Calibration(
             window=WindowIdentity(title="TBH", class_name="Game", process_name="game.exe", client_width=800, client_height=700),
             points={key: Point(10, 20) for key in Calibration.REQUIRED_POINTS},
-            empty_grid_patches=[base64.b64encode(b"abcd").decode()] * 9,
         )
         config = AppConfig(calibration=calibration)
         with tempfile.TemporaryDirectory() as directory:
@@ -157,8 +176,8 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(loaded.interval_seconds, 18_000)
         self.assertEqual(loaded.combination_wait_seconds, 2.5)
 
-    def test_old_grid_baseline_is_rejected(self) -> None:
-        old_calibration = {
+    def test_version_eight_calibration_migrates_without_grid_baseline(self) -> None:
+        previous_calibration = {
             "window": {
                 "title": "TBH",
                 "class_name": "Game",
@@ -167,23 +186,14 @@ class ConfigTests(unittest.TestCase):
                 "client_height": 700,
             },
             "points": {key: {"x": 10, "y": 20} for key in Calibration.REQUIRED_POINTS},
-            "empty_grid_patches": [base64.b64encode(b"abcd").decode()] * 9,
-            "calibration_version": 6,
-            "patch_size": 16,
+            "empty_grid_patches": ["obsolete"] * 9,
+            "calibration_version": 8,
+            "patch_size": 32,
         }
-        with self.assertRaisesRegex(ValueError, "重新"):
-            Calibration.from_dict(old_calibration)
+        calibration = Calibration.from_dict(previous_calibration)
 
-    def test_greyscale_terminal_baseline_is_rejected(self) -> None:
-        greyscale_patch = pixel(12, 12, 12) * (32 * 32)
-        calibration = Calibration(
-            window=WindowIdentity(client_width=800, client_height=700),
-            points={key: Point(10, 20) for key in Calibration.REQUIRED_POINTS},
-            empty_grid_patches=[base64.b64encode(greyscale_patch).decode()] * 9,
-        )
-
-        with self.assertRaisesRegex(ValueError, "终端"):
-            calibration.validate()
+        self.assertEqual(calibration.calibration_version, 9)
+        self.assertFalse(hasattr(calibration, "empty_grid_patches"))
 
     def test_stale_calibration_is_migrated_once_without_losing_settings(self) -> None:
         stale_config = {
@@ -199,7 +209,7 @@ class ConfigTests(unittest.TestCase):
                     key: {"x": 10, "y": 20}
                     for key in Calibration.REQUIRED_POINTS
                 },
-                "empty_grid_patches": [base64.b64encode(b"abcd").decode()] * 9,
+                "empty_grid_patches": ["obsolete"] * 9,
                 "calibration_version": 6,
                 "patch_size": 32,
                 "difference_threshold": 15.0,
@@ -221,6 +231,7 @@ class ConfigTests(unittest.TestCase):
         self.assertIsNone(loaded.calibration)
         self.assertEqual(loaded.interval_seconds, 12345)
         self.assertIsNone(rewritten["calibration"])
+        self.assertEqual(rewritten["version"], 6)
 
 
 
