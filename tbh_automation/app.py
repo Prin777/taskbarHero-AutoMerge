@@ -5,9 +5,18 @@ import base64
 import queue
 import threading
 import time
-import tkinter as tk
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+
+from .dpi import awareness_name, enable_per_monitor_dpi_awareness
+
+# 必须在导入 tkinter、创建任何窗口以及首次调用坐标 API 之前完成。否则
+# ClientToScreen/GetCursorPos 会返回逻辑坐标，而桌面 BitBlt 使用物理像素。
+DPI_AWARENESS = enable_per_monitor_dpi_awareness()
+
+import tkinter as tk
 from tkinter import messagebox, ttk
 
 from .autodetect import find_auto_fill_anchor, layout_points_from_anchor
@@ -22,24 +31,41 @@ from .windows import (
     describe_window,
     encode_empty_grid,
     get_foreground_root,
+    get_window_dpi,
     save_bgra_bmp,
+    temporarily_uncover_window,
 )
 
 
 LOG = logging.getLogger("tbh_automation")
 
 
-def configure_logging() -> None:
+def scaled_pixels(value: int, scale: float) -> int:
+    """把旧版 DPI 虚拟化下的界面像素换算为当前物理像素。"""
+    return max(1, round(value * max(1.0, scale)))
+
+
+def configure_logging() -> Path:
     app_dir = default_app_dir()
     app_dir.mkdir(parents=True, exist_ok=True)
+    session_dir = app_dir / "diagnostics" / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    session_dir.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
         handlers=[
-            logging.FileHandler(app_dir / "automation.log", encoding="utf-8"),
+            RotatingFileHandler(
+                app_dir / "automation.log",
+                maxBytes=5 * 1024 * 1024,
+                backupCount=5,
+                encoding="utf-8",
+            ),
+            logging.FileHandler(session_dir / "session.log", encoding="utf-8"),
             logging.StreamHandler(),
         ],
     )
+    LOG.info("本次诊断资料将自动保存到：%s", session_dir)
+    return session_dir
 
 
 @dataclass(frozen=True)
@@ -79,11 +105,20 @@ def manual_grid_baseline_is_acceptable(encoded_patches: list[str]) -> bool:
 
 
 class TaskbarHeroApp:
-    def __init__(self, root: tk.Tk) -> None:
+    def __init__(self, root: tk.Tk, diagnostics_dir: Path | None = None) -> None:
         self.root = root
+        self.diagnostics_dir = diagnostics_dir
         self.root.title("TBH 自动合成")
+        self.ui_scale = max(1.0, float(self.root.winfo_fpixels("1i")) / 96.0)
+        width = self._px(410)
+        height = self._px(340)
+        right_margin = self._px(20)
+        top_margin = self._px(20)
         screen_width = self.root.winfo_screenwidth()
-        self.root.geometry(f"410x340+{max(10, screen_width - 430)}+20")
+        self.root.geometry(
+            f"{width}x{height}+{max(self._px(10), screen_width - width - right_margin)}"
+            f"+{top_margin}"
+        )
         self.root.resizable(False, False)
         self.root.attributes("-topmost", True)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
@@ -137,8 +172,11 @@ class TaskbarHeroApp:
         else:
             self._set_status("托管中", "启动后将立即执行一轮", "#137333")
 
+    def _px(self, value: int) -> int:
+        return scaled_pixels(value, self.ui_scale)
+
     def _build_ui(self) -> None:
-        outer = ttk.Frame(self.root, padding=14)
+        outer = ttk.Frame(self.root, padding=self._px(14))
         outer.pack(fill="both", expand=True)
 
         self.status_label = tk.Label(
@@ -147,25 +185,42 @@ class TaskbarHeroApp:
             bg="#137333",
             fg="white",
             font=("Microsoft YaHei UI", 15, "bold"),
-            pady=9,
+            pady=self._px(9),
         )
         self.status_label.pack(fill="x")
-        ttk.Label(outer, textvariable=self.detail_var, anchor="center", wraplength=370).pack(fill="x", pady=(8, 2))
-        ttk.Label(outer, textvariable=self.countdown_var, anchor="center").pack(fill="x", pady=2)
-        ttk.Label(outer, textvariable=self.stats_var, anchor="center").pack(fill="x", pady=(2, 10))
+        ttk.Label(
+            outer,
+            textvariable=self.detail_var,
+            anchor="center",
+            wraplength=self._px(370),
+        ).pack(fill="x", pady=(self._px(8), self._px(2)))
+        ttk.Label(outer, textvariable=self.countdown_var, anchor="center").pack(
+            fill="x", pady=self._px(2)
+        )
+        ttk.Label(outer, textvariable=self.stats_var, anchor="center").pack(
+            fill="x", pady=(self._px(2), self._px(10))
+        )
 
         buttons = ttk.Frame(outer)
         buttons.pack(fill="x")
         self.toggle_button = ttk.Button(buttons, text="暂停托管 (F8)", command=self.toggle_enabled)
-        self.toggle_button.pack(side="left", expand=True, fill="x", padx=(0, 4))
-        ttk.Button(buttons, text="立即执行", command=self.run_now).pack(side="left", expand=True, fill="x", padx=(4, 0))
+        self.toggle_button.pack(side="left", expand=True, fill="x", padx=(0, self._px(4)))
+        ttk.Button(buttons, text="立即执行", command=self.run_now).pack(
+            side="left", expand=True, fill="x", padx=(self._px(4), 0)
+        )
 
         calibration_buttons = ttk.Frame(outer)
-        calibration_buttons.pack(fill="x", pady=(7, 0))
-        ttk.Button(calibration_buttons, text="自动识别位置", command=self.start_auto_detection).pack(side="left", expand=True, fill="x", padx=(0, 4))
-        ttk.Button(calibration_buttons, text="手动校准", command=self.start_calibration).pack(side="left", expand=True, fill="x", padx=(4, 0))
+        calibration_buttons.pack(fill="x", pady=(self._px(7), 0))
+        ttk.Button(
+            calibration_buttons,
+            text="自动识别位置",
+            command=self.start_auto_detection,
+        ).pack(side="left", expand=True, fill="x", padx=(0, self._px(4)))
+        ttk.Button(calibration_buttons, text="手动校准", command=self.start_calibration).pack(
+            side="left", expand=True, fill="x", padx=(self._px(4), 0)
+        )
 
-        ttk.Separator(outer).pack(fill="x", pady=12)
+        ttk.Separator(outer).pack(fill="x", pady=self._px(12))
         ttk.Label(
             outer,
             text="F8 开启/暂停　　F9 紧急停止\n仅当游戏窗口位于前台时才会操作鼠标",
@@ -177,8 +232,8 @@ class TaskbarHeroApp:
             textvariable=self.hotkey_warning_var,
             foreground="#b3261e",
             anchor="center",
-            wraplength=370,
-        ).pack(fill="x", pady=(4, 0))
+            wraplength=self._px(370),
+        ).pack(fill="x", pady=(self._px(4), 0))
 
     def _show_hotkey_warning(self, message: str) -> None:
         current = self.hotkey_warning_var.get()
@@ -253,8 +308,9 @@ class TaskbarHeroApp:
                 self.gate,
                 generation,
                 click_delay=self.config.click_delay_seconds,
-                action_timeout=self.config.action_timeout_seconds,
+                combination_wait=self.config.combination_wait_seconds,
                 status=self._post_status,
+                diagnostics_dir=self.diagnostics_dir,
             )
             engine = SynthesisEngine(
                 driver,
@@ -341,21 +397,31 @@ class TaskbarHeroApp:
             if not hwnd:
                 raise ValueError("没有找到前台窗口")
             identity = describe_window(hwnd)
-            image, width, height = capture_client_bgra(hwnd)
-            LOG.info(
-                "自动识别截图：window=%r process=%r client=%dx%d",
-                identity.title,
-                identity.process_name,
-                width,
-                height,
-            )
-            result = find_auto_fill_anchor(image, width, height)
-            calibration = Calibration(
-                window=identity,
-                points=layout_points_from_anchor(result.anchor, result.scale),
-                empty_grid_patches=[""] * 9,
-            )
-            calibration.empty_grid_patches = encode_empty_grid(hwnd, calibration)
+            with temporarily_uncover_window(hwnd, report_obstruction=True):
+                image, width, height = capture_client_bgra(hwnd)
+                window_dpi = get_window_dpi(hwnd)
+                LOG.info(
+                    "自动识别截图：window=%r process=%r client=%dx%d dpi=%d scale=%.2f",
+                    identity.title,
+                    identity.process_name,
+                    width,
+                    height,
+                    window_dpi,
+                    window_dpi / 96,
+                )
+                result = find_auto_fill_anchor(
+                    image,
+                    width,
+                    height,
+                    preferred_scale=window_dpi / 96,
+                    require_button_color=True,
+                )
+                calibration = Calibration(
+                    window=identity,
+                    points=layout_points_from_anchor(result.anchor, result.scale),
+                    empty_grid_patches=[""] * 9,
+                )
+                calibration.empty_grid_patches = encode_empty_grid(hwnd, calibration)
             if not manual_grid_baseline_is_acceptable(calibration.empty_grid_patches):
                 raise ValueError("无法完整采集九宫格基准，请使用手动校准")
             calibration.validate()
@@ -416,19 +482,32 @@ class TaskbarHeroApp:
         wizard = tk.Toplevel(self.root)
         self._wizard = wizard
         wizard.title("TBH 位置校准")
-        wizard.geometry("470x230+20+20")
+        wizard.geometry(
+            f"{self._px(470)}x{self._px(230)}+{self._px(20)}+{self._px(20)}"
+        )
         wizard.resizable(False, False)
         wizard.attributes("-topmost", True)
         wizard.protocol("WM_DELETE_WINDOW", self._cancel_calibration)
-        frame = ttk.Frame(wizard, padding=16)
+        frame = ttk.Frame(wizard, padding=self._px(16))
         frame.pack(fill="both", expand=True)
         self.calibration_progress_var = tk.StringVar()
         self.calibration_title_var = tk.StringVar()
         self.calibration_instruction_var = tk.StringVar()
         ttk.Label(frame, textvariable=self.calibration_progress_var).pack(anchor="w")
-        ttk.Label(frame, textvariable=self.calibration_title_var, font=("Microsoft YaHei UI", 14, "bold")).pack(anchor="w", pady=(10, 6))
-        ttk.Label(frame, textvariable=self.calibration_instruction_var, wraplength=430, justify="left").pack(anchor="w")
-        ttk.Label(frame, text="按 F7 或点击下方按钮捕获。F8/F9 在校准期间不会启动操作。", foreground="#666666").pack(anchor="w", pady=(12, 0))
+        ttk.Label(frame, textvariable=self.calibration_title_var, font=("Microsoft YaHei UI", 14, "bold")).pack(
+            anchor="w", pady=(self._px(10), self._px(6))
+        )
+        ttk.Label(
+            frame,
+            textvariable=self.calibration_instruction_var,
+            wraplength=self._px(430),
+            justify="left",
+        ).pack(anchor="w")
+        ttk.Label(
+            frame,
+            text="按 F7 或点击下方按钮捕获。F8/F9 在校准期间不会启动操作。",
+            foreground="#666666",
+        ).pack(anchor="w", pady=(self._px(12), 0))
         wizard_buttons = ttk.Frame(frame)
         wizard_buttons.pack(side="bottom", fill="x")
         ttk.Button(wizard_buttons, text="3 秒后捕获鼠标位置", command=self._capture_after_delay).pack(side="left")
@@ -505,13 +584,15 @@ class TaskbarHeroApp:
                 points=dict(self._calibration_points),
                 empty_grid_patches=[""] * 9,
             )
-            calibration.empty_grid_patches = encode_empty_grid(self._calibration_hwnd, calibration)
+            with temporarily_uncover_window(self._calibration_hwnd, report_obstruction=True):
+                calibration.empty_grid_patches = encode_empty_grid(self._calibration_hwnd, calibration)
             if not manual_grid_baseline_is_acceptable(calibration.empty_grid_patches):
                 raise ValueError("九宫格看起来并非完全为空，请清空后重新校准")
             calibration.validate()
             self.config.calibration = calibration
             self.config.save()
         except Exception:
+            LOG.exception("手动校准最终截图失败，未保存无效基准")
             self.root.deiconify()
             self._wizard.deiconify()
             raise
@@ -544,7 +625,8 @@ class TaskbarHeroApp:
 
 
 def main() -> None:
-    configure_logging()
+    diagnostics_dir = configure_logging()
+    LOG.info("DPI 坐标模式：%s", awareness_name(DPI_AWARENESS))
     root = tk.Tk()
-    TaskbarHeroApp(root)
+    TaskbarHeroApp(root, diagnostics_dir)
     root.mainloop()

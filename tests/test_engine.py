@@ -13,8 +13,10 @@ from tbh_automation.engine import (
 
 
 class FakeDriver:
-    def __init__(self, observations: list[int]) -> None:
+    def __init__(self, observations: list[int], readiness: list[bool] | None = None) -> None:
         self.observations = iter(observations)
+        self.readiness = iter(readiness) if readiness is not None else None
+        self.last_observation = 0
         self.actions: list[str] = []
 
     def checkpoint(self) -> None:
@@ -28,7 +30,13 @@ class FakeDriver:
 
     def observe_filled_cells(self) -> int:
         value = next(self.observations)
+        self.last_observation = value
         self.actions.append(f"observe:{value}")
+        return value
+
+    def combine_button_is_enabled(self) -> bool:
+        value = next(self.readiness) if self.readiness is not None else self.last_observation == 9
+        self.actions.append(f"ready:{value}")
         return value
 
     def click_combine(self) -> None:
@@ -54,6 +62,15 @@ class SynthesisEngineTests(unittest.TestCase):
         )
         self.assertNotIn("select:饰品", driver.actions)
         self.assertEqual(driver.actions.count("combine"), 1)
+        combine_index = driver.actions.index("combine")
+        next_fill_index = driver.actions.index("fill", combine_index)
+        next_observe_index = next(
+            index
+            for index in range(next_fill_index + 1, len(driver.actions))
+            if driver.actions[index].startswith("observe:")
+        )
+        self.assertLess(combine_index, next_fill_index)
+        self.assertLess(next_fill_index, next_observe_index)
 
     def test_first_underfull_then_retry_full_combines(self) -> None:
         driver = FakeDriver([4, 9, 0, 0, 0, 0])
@@ -75,12 +92,34 @@ class SynthesisEngineTests(unittest.TestCase):
         self.assertEqual(driver.actions.count("return"), 5)
         self.assertEqual(driver.actions.count("fill"), 4)
 
+    def test_false_full_grid_never_clicks_a_grey_combine_button(self) -> None:
+        driver = FakeDriver(
+            [9, 9, 9, 9],
+            readiness=[False, False, False, False],
+        )
+
+        result = SynthesisEngine(driver).run_round()
+
+        self.assertEqual(result.total, 0)
+        self.assertNotIn("combine", driver.actions)
+        self.assertEqual(driver.actions.count("ready:False"), 4)
+
+    def test_blue_button_can_override_a_grid_undercount(self) -> None:
+        driver = FakeDriver(
+            [7, 0, 0, 0, 0],
+            readiness=[True, False, False, False, False],
+        )
+
+        result = SynthesisEngine(driver).run_round()
+
+        self.assertEqual(result.equipment_combinations, 1)
+        self.assertEqual(driver.actions.count("combine"), 1)
+
     def test_safety_limit_stops_a_possible_infinite_loop(self) -> None:
         driver = FakeDriver([9, 9])
         engine = SynthesisEngine(driver, max_combinations_per_category=2)
         with self.assertRaises(AutomationError):
             engine.run_round()
-
 
 class ControlGateTests(unittest.TestCase):
     def test_pause_cancels_current_generation(self) -> None:

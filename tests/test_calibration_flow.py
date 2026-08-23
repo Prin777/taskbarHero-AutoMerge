@@ -8,6 +8,7 @@ from tbh_automation.app import (
     CALIBRATION_STEPS,
     calibration_step_or_finish,
     manual_grid_baseline_is_acceptable,
+    scaled_pixels,
 )
 
 
@@ -17,6 +18,10 @@ def uniform_patch(gray: int) -> str:
 
 
 class CalibrationFlowTests(unittest.TestCase):
+    def test_ui_pixels_restore_previous_size_at_150_percent(self) -> None:
+        self.assertEqual(scaled_pixels(410, 1.5), 615)
+        self.assertEqual(scaled_pixels(340, 1.5), 510)
+
     def test_retry_after_final_validation_failure_retries_finish_without_indexing_step_nine(self) -> None:
         action, step = calibration_step_or_finish(len(CALIBRATION_STEPS))
         self.assertEqual(action, "finish")

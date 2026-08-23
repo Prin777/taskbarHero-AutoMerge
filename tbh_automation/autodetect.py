@@ -25,10 +25,12 @@ AUTO_FILL_MASK = (
 MASK_WIDTH = len(AUTO_FILL_MASK[0])
 MASK_HEIGHT = len(AUTO_FILL_MASK)
 GRAY_THRESHOLD = 65
-MAX_MISMATCH_RATIO = 0.18
+MAX_MISMATCH_RATIO = 0.22
 MAX_PREFILTER_MISMATCHES = 4
 PREFILTER_SAMPLES_PER_STATE = 8
 STRONG_MATCH_RATIO = 0.08
+PREFERRED_SCALE_EARLY_ACCEPT_RATIO = 0.205
+MIN_BUTTON_BROWN_RATIO = 0.15
 SUPPORTED_SCALES = (1.0, 1.25, 1.5, 1.75, 2.0, 0.8, 0.75)
 
 
@@ -116,7 +118,42 @@ def _best_match_at_scale(
     return best_point, best_ratio
 
 
-def find_auto_fill_anchor(image_bgra: bytes, width: int, height: int) -> AutoDetectionResult:
+def _button_brown_ratio(
+    image_bgra: bytes,
+    width: int,
+    height: int,
+    anchor: Point,
+    scale: float,
+) -> float:
+    """核对文字周围确实是棕色自动填充按钮，排除终端白字等假匹配。"""
+    center_x = anchor.x + round(29 * scale)
+    center_y = anchor.y + round(7 * scale)
+    half_width = max(12, round(20 * scale))
+    half_height = max(7, round(10 * scale))
+    left = max(0, center_x - half_width)
+    right = min(width, center_x + half_width)
+    top = max(0, center_y - half_height)
+    bottom = min(height, center_y + half_height)
+    total = max(0, right - left) * max(0, bottom - top)
+    if total == 0:
+        return 0.0
+    brown = 0
+    for y in range(top, bottom):
+        for x in range(left, right):
+            offset = (y * width + x) * 4
+            blue, green, red = image_bgra[offset : offset + 3]
+            if red >= 55 and red >= green + 12 and green >= blue + 4:
+                brown += 1
+    return brown / total
+
+
+def find_auto_fill_anchor(
+    image_bgra: bytes,
+    width: int,
+    height: int,
+    preferred_scale: float | None = None,
+    require_button_color: bool = False,
+) -> AutoDetectionResult:
     """在前台窗口截图中以常见界面缩放比例寻找“自动填充”文字。"""
     if len(image_bgra) != width * height * 4:
         raise ValueError("自动识别截图尺寸不正确")
@@ -127,17 +164,40 @@ def find_auto_fill_anchor(image_bgra: bytes, width: int, height: int) -> AutoDet
     best_point: Point | None = None
     best_ratio = 1.0
     best_scale = 1.0
-    for scale in SUPPORTED_SCALES:
+    scales = SUPPORTED_SCALES
+    if preferred_scale is not None:
+        # DPI 感知后截图为物理像素，优先搜索当前显示器的缩放比例。匹配足够
+        # 强时可立即结束；其他比例仍保留为游戏自身 UI 缩放的回退。
+        scales = tuple(sorted(SUPPORTED_SCALES, key=lambda value: abs(value - preferred_scale)))
+    for index, scale in enumerate(scales):
         point, ratio = _best_match_at_scale(gray, width, height, scale)
         if point is not None and ratio < best_ratio:
             best_point = point
             best_ratio = ratio
             best_scale = scale
+        if (
+            index == 0
+            and preferred_scale is not None
+            and point is not None
+            and ratio <= PREFERRED_SCALE_EARLY_ACCEPT_RATIO
+            and (
+                not require_button_color
+                or _button_brown_ratio(image_bgra, width, height, point, scale)
+                >= MIN_BUTTON_BROWN_RATIO
+            )
+        ):
+            return AutoDetectionResult(anchor=point, mismatch_ratio=ratio, scale=scale)
         if best_ratio <= STRONG_MATCH_RATIO:
             break
 
     if best_point is None or best_ratio > MAX_MISMATCH_RATIO:
         raise ValueError("未能可靠识别“自动填充”按钮，请使用手动校准")
+    if (
+        require_button_color
+        and _button_brown_ratio(image_bgra, width, height, best_point, best_scale)
+        < MIN_BUTTON_BROWN_RATIO
+    ):
+        raise ValueError("识别到相似文字，但未检测到棕色“自动填充”按钮，请使用手动校准")
     return AutoDetectionResult(anchor=best_point, mismatch_ratio=best_ratio, scale=best_scale)
 
 
