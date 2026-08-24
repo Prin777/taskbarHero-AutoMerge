@@ -18,6 +18,7 @@ tmp-validation/
 
 # Local runtime data and diagnostics
 *.log
+diagnostics/
 config.json
 auto-detect-failure.bmp
 

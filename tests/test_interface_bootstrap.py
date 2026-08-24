@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import unittest
 from contextlib import nullcontext
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
 
 from tbh_automation.autodetect import AutoDetectionResult, CubeIconDetectionResult
@@ -83,8 +85,40 @@ class InterfaceBootstrapTests(unittest.TestCase):
         click.assert_called_once_with(123, cube.center, "黄色魔方入口")
         self.assertEqual(waits, [1.0, 1.2])
 
-    def test_cube_in_other_mode_is_reopened_once(self) -> None:
-        result = AutoDetectionResult(Point(100, 200), 0.1, 1.5)
+    def test_failed_cube_detection_saves_every_capture_stage(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            diagnostics_dir = Path(temporary_directory)
+            with (
+                patch("tbh_automation.windows.temporarily_uncover_window", return_value=nullcontext()),
+                patch(
+                    "tbh_automation.windows.capture_client_bgra",
+                    side_effect=[(b"closed", 800, 700), (b"hero", 800, 700)],
+                ),
+                patch("tbh_automation.windows.get_window_dpi", return_value=120),
+                patch(
+                    "tbh_automation.windows.client_to_screen",
+                    return_value=Point(10, 20),
+                ),
+                patch(
+                    "tbh_automation.windows.find_cube_icon",
+                    side_effect=[ValueError("closed"), ValueError("missing")],
+                ),
+                patch("tbh_automation.windows.press_tab_on_game"),
+                patch("tbh_automation.windows.save_bgra_bmp") as save_bmp,
+            ):
+                with self.assertRaisesRegex(ValueError, "missing"):
+                    open_synthesis_interface(
+                        123,
+                        wait=lambda _seconds: None,
+                        diagnostics_dir=diagnostics_dir,
+                    )
+
+        saved_names = [call.args[0].name for call in save_bmp.call_args_list]
+        self.assertEqual(len(saved_names), 2)
+        self.assertTrue(saved_names[0].endswith("-initial.bmp"))
+        self.assertTrue(saved_names[1].endswith("-after-tab.bmp"))
+
+    def test_unrecognized_cube_page_is_not_clicked_again(self) -> None:
         cube = CubeIconDetectionResult(Point(300, 500), (270, 470, 330, 530), 500)
         click = Mock()
         with (
@@ -93,22 +127,21 @@ class InterfaceBootstrapTests(unittest.TestCase):
                 "tbh_automation.windows.capture_client_bgra",
                 side_effect=[
                     (b"other-mode", 800, 700),
-                    (b"closed", 800, 700),
-                    (b"synthesis", 800, 700),
+                    (b"unrecognized", 800, 700),
                 ],
             ),
             patch("tbh_automation.windows.get_window_dpi", return_value=144),
             patch(
                 "tbh_automation.windows.find_auto_fill_anchor",
-                side_effect=[ValueError("other"), ValueError("closed"), result],
+                side_effect=[ValueError("other"), ValueError("unrecognized")],
             ),
             patch("tbh_automation.windows.find_cube_icon", return_value=cube),
             patch("tbh_automation.windows.click_game_point", click),
         ):
-            open_synthesis_interface(123, wait=lambda _seconds: None)
+            with self.assertRaisesRegex(ValueError, "unrecognized"):
+                open_synthesis_interface(123, wait=lambda _seconds: None)
 
-        self.assertEqual(click.call_count, 2)
-        self.assertEqual(click.call_args_list[1].args[2], "黄色魔方入口（重新打开合成）")
+        click.assert_called_once_with(123, cube.center, "黄色魔方入口")
 
 
 if __name__ == "__main__":

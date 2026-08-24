@@ -582,13 +582,50 @@ def open_synthesis_interface(
     hwnd: int,
     *,
     wait: Callable[[float], None] | None = None,
+    diagnostics_dir: Path | None = None,
 ) -> tuple[bytes, int, int, AutoDetectionResult]:
     """必要时打开英雄背包和魔方，并返回自动填充文字的识别结果。"""
     pause = wait or time.sleep
 
-    def capture() -> tuple[bytes, int, int]:
+    def capture(stage: str) -> tuple[bytes, int, int]:
         with temporarily_uncover_window(hwnd, report_obstruction=True):
-            return capture_client_bgra(hwnd)
+            image, width, height = capture_client_bgra(hwnd)
+        if diagnostics_dir is not None:
+            try:
+                dpi = get_window_dpi(hwnd)
+                origin = client_to_screen(hwnd, Point(0, 0))
+                LOG.info(
+                    "自动识别环境：stage=%s hwnd=%d client=%dx%d origin=(%d,%d) "
+                    "primary=%dx%d virtual=(%d,%d,%dx%d) dpi=%d scale=%.2f",
+                    stage,
+                    hwnd,
+                    width,
+                    height,
+                    origin.x,
+                    origin.y,
+                    user32.GetSystemMetrics(0),
+                    user32.GetSystemMetrics(1),
+                    user32.GetSystemMetrics(76),
+                    user32.GetSystemMetrics(77),
+                    user32.GetSystemMetrics(78),
+                    user32.GetSystemMetrics(79),
+                    dpi,
+                    dpi / 96,
+                )
+            except Exception:
+                LOG.exception("记录自动识别显示环境失败，但识别将继续")
+            try:
+                timestamp = datetime.now().strftime("%H%M%S-%f")
+                path = save_bgra_bmp(
+                    diagnostics_dir / f"{timestamp}-auto-detect-{stage}.bmp",
+                    image,
+                    width,
+                    height,
+                )
+                LOG.info("自动识别阶段截图：stage=%s path=%s", stage, path)
+            except Exception:
+                LOG.exception("保存自动识别阶段截图失败，但识别将继续")
+        return image, width, height
 
     def detect(
         image: bytes,
@@ -604,7 +641,7 @@ def open_synthesis_interface(
             require_button_color=True,
         )
 
-    image, width, height = capture()
+    image, width, height = capture("initial")
     try:
         cube = find_cube_icon(image, width, height)
         LOG.info("英雄背包已打开：识别到魔方入口 %s", cube)
@@ -612,7 +649,7 @@ def open_synthesis_interface(
         LOG.info("当前未显示英雄背包，开始自动准备界面")
         press_tab_on_game(hwnd)
         pause(1.0)
-        image, width, height = capture()
+        image, width, height = capture("after-tab")
         cube = find_cube_icon(image, width, height)
         LOG.info("按 Tab 后识别到魔方入口：%s", cube)
     else:
@@ -623,16 +660,10 @@ def open_synthesis_interface(
 
     click_game_point(hwnd, cube.center, "黄色魔方入口")
     pause(1.2)
-    image, width, height = capture()
-    try:
-        return image, width, height, detect(image, width, height)
-    except ValueError:
-        # 魔方原先若停在不含自动填充的功能页，第一次点击可能关闭窗口；
-        # 再点一次按游戏默认行为重新打开到“合成”。
-        click_game_point(hwnd, cube.center, "黄色魔方入口（重新打开合成）")
-        pause(1.2)
-        image, width, height = capture()
-        return image, width, height, detect(image, width, height)
+    image, width, height = capture("after-cube-click")
+    # 无法识别自动填充时直接安全失败。再次点击同一入口可能把已经打开的
+    # 合成面板关闭，不能仅凭文字识别失败推断当前页面状态。
+    return image, width, height, detect(image, width, height)
 
 
 def bitmap_bgra(memory_dc: int, bitmap: int, width: int, height: int) -> bytes:
@@ -802,6 +833,7 @@ class Win32AutomationDriver:
                     seconds,
                     self.generation,
                 ),
+                diagnostics_dir=getattr(self, "diagnostics_dir", None),
             )
         except ValueError as error:
             raise AutomationError(f"自动准备游戏界面失败：{error}") from error

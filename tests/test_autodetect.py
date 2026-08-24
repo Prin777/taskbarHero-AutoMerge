@@ -116,6 +116,39 @@ class AutoDetectionTests(unittest.TestCase):
         self.assertEqual(result.center, Point(370, 300))
         self.assertEqual(result.bounds, (354, 282, 386, 318))
 
+    def test_finds_fragmented_cube_when_navigation_icons_are_small(self) -> None:
+        """复现 125% 显示器截图中较小的真实功能栏比例。"""
+        width, height = 616, 612
+        image = bytearray(gray_bgra(32) * (width * height))
+        brown = bytes((10, 30, 70, 255))
+        yellow = bytes((20, 150, 220, 255))
+        centers = (124, 170, 216, 262)
+        center_y = 390
+        for center_x in centers:
+            paint_rectangle(
+                image,
+                width,
+                center_x - 19,
+                center_y - 19,
+                center_x + 19,
+                center_y + 19,
+                brown,
+            )
+
+        # 前三个功能图标约为 21×18 像素；旧规则要求宽高均至少 24 像素。
+        paint_rectangle(image, width, 114, 381, 134, 398, yellow)
+        paint_rectangle(image, width, 160, 381, 180, 399, yellow)
+        paint_rectangle(image, width, 206, 380, 226, 400, yellow)
+        # 魔方被深色线条切成三块，必须由前三个等距图标推导后再整体复核。
+        paint_rectangle(image, width, 253, 379, 270, 386, yellow)
+        paint_rectangle(image, width, 252, 389, 260, 402, yellow)
+        paint_rectangle(image, width, 264, 389, 272, 402, yellow)
+
+        result = find_cube_icon(bytes(image), width, height)
+
+        self.assertEqual(result.center, Point(262, 390))
+        self.assertEqual(result.bounds, (252, 379, 272, 402))
+
     def test_large_bottom_scene_icon_from_runtime_log_is_rejected(self) -> None:
         width, height = 1455, 1338
         image = bytearray(gray_bgra(20) * (width * height))
@@ -207,6 +240,41 @@ class AutoDetectionTests(unittest.TestCase):
                 preferred_scale=1.0,
                 require_button_color=True,
             )
+
+    def test_button_color_prefilter_allows_text_over_the_center_pixel(self) -> None:
+        width, height = 180, 80
+        anchor = Point(73, 31)
+        center = Point(anchor.x + 29, anchor.y + 7)
+        image = bytearray(gray_bgra(25) * (width * height))
+        paint_rectangle(
+            image,
+            width,
+            center.x - 24,
+            center.y - 12,
+            center.x + 24,
+            center.y + 12,
+            bytes((10, 30, 70, 255)),
+        )
+        for y, row in enumerate(AUTO_FILL_MASK):
+            for x, character in enumerate(row):
+                if character != "#":
+                    continue
+                offset = ((anchor.y + y) * width + anchor.x + x) * 4
+                image[offset:offset + 4] = gray_bgra(105)
+        # 真实截图中按钮中心落在文字边缘，RGB=(67,56,45)，红绿差仅 11。
+        center_offset = (center.y * width + center.x) * 4
+        image[center_offset:center_offset + 4] = bytes((45, 56, 67, 255))
+
+        result = find_auto_fill_anchor(
+            bytes(image),
+            width,
+            height,
+            preferred_scale=1.0,
+            require_button_color=True,
+        )
+
+        self.assertEqual(result.anchor, anchor)
+        self.assertEqual(result.scale, 1.0)
 
     def test_large_capture_does_not_skip_an_odd_pixel_anchor(self) -> None:
         width, height = 671, 643

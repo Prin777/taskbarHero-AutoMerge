@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 from .model import Point
@@ -32,6 +33,15 @@ STRONG_MATCH_RATIO = 0.08
 PREFERRED_SCALE_EARLY_ACCEPT_RATIO = 0.205
 MIN_BUTTON_BROWN_RATIO = 0.15
 SUPPORTED_SCALES = (1.0, 1.25, 1.5, 1.75, 2.0, 0.8, 0.75)
+MIN_SUPPORTED_SCALE = min(SUPPORTED_SCALES)
+CUBE_OUTLINE_MIN_PIXELS = round(200 * MIN_SUPPORTED_SCALE ** 2)
+CUBE_OUTLINE_MIN_SIZE = round(40 * MIN_SUPPORTED_SCALE)
+CUBE_SOLID_MIN_PIXELS = round(180 * MIN_SUPPORTED_SCALE ** 2)
+CUBE_SOLID_MIN_SIZE = round(24 * MIN_SUPPORTED_SCALE)
+CUBE_COMPONENT_LOG_MIN_PIXELS = 20
+
+
+LOG = logging.getLogger("tbh_automation.autodetect")
 
 
 @dataclass(frozen=True)
@@ -109,13 +119,11 @@ def _best_match_at_scale(
             if brown_mask is not None:
                 center_x = x + round(29 * scale)
                 center_y = y + round(7 * scale)
-                if (
-                    not (0 <= center_x < width and 0 <= center_y < height)
-                    or not brown_mask[center_y * width + center_x]
-                ):
+                if not (0 <= center_x < width and 0 <= center_y < height):
                     continue
-                brown_samples = 1
+                brown_samples = 0
                 for delta_x, delta_y in (
+                    (0, 0),
                     (-12, -5), (12, -5),
                     (-12, 5), (12, 5),
                     (-22, 0), (22, 0),
@@ -370,30 +378,51 @@ def find_cube_icon(image_bgra: bytes, width: int, height: int) -> CubeIconDetect
         aspect = component_width / component_height
         density = count / (component_width * component_height)
         outline_style = (
-            count >= 200
-            and 40 <= component_width <= 120
-            and 40 <= component_height <= 120
+            count >= CUBE_OUTLINE_MIN_PIXELS
+            and CUBE_OUTLINE_MIN_SIZE <= component_width <= 120
+            and CUBE_OUTLINE_MIN_SIZE <= component_height <= 120
             and 0.65 <= aspect <= 1.4
             and density <= 0.24
         )
         solid_style = (
-            count >= 180
-            and 24 <= component_width <= 80
-            and 24 <= component_height <= 80
+            count >= CUBE_SOLID_MIN_PIXELS
+            and CUBE_SOLID_MIN_SIZE <= component_width <= 80
+            and CUBE_SOLID_MIN_SIZE <= component_height <= 80
             and 0.75 <= aspect <= 1.3
             and density >= 0.30
         )
         bounds = (left, top, right, bottom)
-        if (
-            (outline_style or solid_style)
-            and (top + bottom) // 2 <= round(height * 0.88)
-            and _cube_button_brown_ratio(
-                image_bgra,
-                width,
-                height,
+        center_y = (top + bottom) // 2
+        position_ok = center_y <= round(height * 0.88)
+        brown_ratio = _cube_button_brown_ratio(
+            image_bgra,
+            width,
+            height,
+            bounds,
+        )
+        brown_ok = brown_ratio >= 0.25
+        accepted = (outline_style or solid_style) and position_ok and brown_ok
+        if count >= CUBE_COMPONENT_LOG_MIN_PIXELS:
+            rejected_by: list[str] = []
+            if not (outline_style or solid_style):
+                rejected_by.append("尺寸/像素数/长宽比/密度不符合")
+            if not position_ok:
+                rejected_by.append("位置低于客户区88%")
+            if not brown_ok:
+                rejected_by.append("棕色按钮底座不足")
+            LOG.info(
+                "黄色区域：bounds=%s pixels=%d size=%dx%d aspect=%.3f "
+                "density=%.3f brown=%.3f result=%s",
                 bounds,
-            ) >= 0.25
-        ):
+                count,
+                component_width,
+                component_height,
+                aspect,
+                density,
+                brown_ratio,
+                "候选" if accepted else "淘汰（" + "；".join(rejected_by) + "）",
+            )
+        if accepted:
             candidates.append(
                 CubeIconDetectionResult(
                     center=Point((left + right) // 2, (top + bottom) // 2),
@@ -402,6 +431,7 @@ def find_cube_icon(image_bgra: bytes, width: int, height: int) -> CubeIconDetect
                 )
             )
 
+    LOG.info("黄色魔方候选汇总：accepted=%d", len(candidates))
     if len(candidates) == 1:
         return candidates[0]
     inferred = _infer_cube_from_navigation_row(

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+import platform
 import queue
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -9,6 +11,7 @@ from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+from . import __version__
 from .dpi import awareness_name, enable_per_monitor_dpi_awareness
 
 # 必须在导入 tkinter、创建任何窗口以及首次调用坐标 API 之前完成。否则
@@ -42,22 +45,50 @@ def scaled_pixels(value: int, scale: float) -> int:
     return max(1, round(value * max(1.0, scale)))
 
 
+def runtime_output_dir() -> Path:
+    """源码运行时返回脚本目录，打包运行时返回 EXE 所在目录。"""
+    launcher = sys.argv[0] if sys.argv and sys.argv[0] else sys.executable
+    return Path(launcher).resolve().parent
+
+
 def configure_logging() -> Path:
-    app_dir = default_app_dir()
-    app_dir.mkdir(parents=True, exist_ok=True)
-    session_dir = app_dir / "diagnostics" / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    session_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = runtime_output_dir()
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        session_dir = output_dir / "diagnostics" / timestamp
+        session_dir.mkdir(parents=True, exist_ok=True)
+        rotating_handler = RotatingFileHandler(
+            output_dir / "automation.log",
+            maxBytes=5 * 1024 * 1024,
+            backupCount=5,
+            encoding="utf-8",
+        )
+        session_handler = logging.FileHandler(
+            session_dir / "session.log",
+            encoding="utf-8",
+        )
+    except OSError:
+        output_dir = default_app_dir()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        session_dir = output_dir / "diagnostics" / timestamp
+        session_dir.mkdir(parents=True, exist_ok=True)
+        rotating_handler = RotatingFileHandler(
+            output_dir / "automation.log",
+            maxBytes=5 * 1024 * 1024,
+            backupCount=5,
+            encoding="utf-8",
+        )
+        session_handler = logging.FileHandler(
+            session_dir / "session.log",
+            encoding="utf-8",
+        )
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
         handlers=[
-            RotatingFileHandler(
-                app_dir / "automation.log",
-                maxBytes=5 * 1024 * 1024,
-                backupCount=5,
-                encoding="utf-8",
-            ),
-            logging.FileHandler(session_dir / "session.log", encoding="utf-8"),
+            rotating_handler,
+            session_handler,
             logging.StreamHandler(),
         ],
     )
@@ -385,8 +416,23 @@ class TaskbarHeroApp:
             if not hwnd:
                 raise ValueError("未找到正在运行的 TaskBarHero.exe，请先启动游戏")
             identity = describe_window(hwnd)
-            image, width, height, result = open_synthesis_interface(hwnd)
             window_dpi = get_window_dpi(hwnd)
+            LOG.info(
+                "自动识别目标：window=%r process=%r class=%r client=%dx%d "
+                "dpi=%d scale=%.2f diagnostics=%s",
+                identity.title,
+                identity.process_name,
+                identity.class_name,
+                identity.client_width,
+                identity.client_height,
+                window_dpi,
+                window_dpi / 96,
+                self.diagnostics_dir,
+            )
+            image, width, height, result = open_synthesis_interface(
+                hwnd,
+                diagnostics_dir=self.diagnostics_dir,
+            )
             LOG.info(
                 "自动识别截图：window=%r process=%r client=%dx%d dpi=%d scale=%.2f",
                 identity.title,
@@ -415,7 +461,9 @@ class TaskbarHeroApp:
             failure_path = None
             if image is not None and width > 0 and height > 0:
                 try:
-                    failure_path = default_app_dir() / "auto-detect-failure.bmp"
+                    failure_path = (
+                        self.diagnostics_dir or runtime_output_dir()
+                    ) / "auto-detect-failure.bmp"
                     save_bgra_bmp(failure_path, image, width, height)
                     LOG.error("自动识别失败截图已保存：%s", failure_path)
                 except Exception:
@@ -431,7 +479,8 @@ class TaskbarHeroApp:
             messagebox.showerror(
                 "自动识别失败",
                 f"{error}\n\n已停止操作，可点击“手动校准”继续。"
-                + (f"\n失败截图：{failure_path}" if failure_path else ""),
+                + (f"\n失败截图：{failure_path}" if failure_path else "")
+                + (f"\n诊断目录：{self.diagnostics_dir}" if self.diagnostics_dir else ""),
                 parent=self.root,
             )
             return
@@ -597,6 +646,13 @@ class TaskbarHeroApp:
 
 def main() -> None:
     diagnostics_dir = configure_logging()
+    LOG.info(
+        "运行环境：version=%s executable=%s python=%s os=%s",
+        __version__,
+        sys.executable,
+        platform.python_version(),
+        platform.platform(),
+    )
     LOG.info("DPI 坐标模式：%s", awareness_name(DPI_AWARENESS))
     root = tk.Tk()
     TaskbarHeroApp(root, diagnostics_dir)
