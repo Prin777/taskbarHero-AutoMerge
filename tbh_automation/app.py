@@ -8,7 +8,6 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from . import __version__
@@ -38,6 +37,7 @@ from .windows import (
 
 
 LOG = logging.getLogger("tbh_automation")
+LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
 
 
 def scaled_pixels(value: int, scale: float) -> int:
@@ -51,49 +51,74 @@ def runtime_output_dir() -> Path:
     return Path(launcher).resolve().parent
 
 
-def configure_logging() -> Path:
-    output_dir = runtime_output_dir()
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    try:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        session_dir = output_dir / "diagnostics" / timestamp
-        session_dir.mkdir(parents=True, exist_ok=True)
-        rotating_handler = RotatingFileHandler(
-            output_dir / "automation.log",
-            maxBytes=5 * 1024 * 1024,
-            backupCount=5,
-            encoding="utf-8",
-        )
-        session_handler = logging.FileHandler(
-            session_dir / "session.log",
-            encoding="utf-8",
-        )
-    except OSError:
-        output_dir = default_app_dir()
-        output_dir.mkdir(parents=True, exist_ok=True)
-        session_dir = output_dir / "diagnostics" / timestamp
-        session_dir.mkdir(parents=True, exist_ok=True)
-        rotating_handler = RotatingFileHandler(
-            output_dir / "automation.log",
-            maxBytes=5 * 1024 * 1024,
-            backupCount=5,
-            encoding="utf-8",
-        )
-        session_handler = logging.FileHandler(
-            session_dir / "session.log",
-            encoding="utf-8",
-        )
+def configure_logging() -> None:
+    """默认只输出到控制台；用户勾选后再启用会话文件日志。"""
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-        handlers=[
-            rotating_handler,
-            session_handler,
-            logging.StreamHandler(),
-        ],
+        format=LOG_FORMAT,
+        handlers=[logging.StreamHandler()],
     )
-    LOG.info("本次诊断资料将自动保存到：%s", session_dir)
-    return session_dir
+
+
+class SessionLogging:
+    """按需管理单次会话日志及其诊断目录。"""
+
+    def __init__(self) -> None:
+        self.session_dir: Path | None = None
+        self._handler: logging.FileHandler | None = None
+
+    def enable(self) -> Path:
+        if self.session_dir is not None and self._handler is not None:
+            return self.session_dir
+
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        candidates = [runtime_output_dir(), default_app_dir()]
+        last_error: OSError | None = None
+        for output_dir in candidates:
+            try:
+                session_dir = output_dir / "diagnostics" / timestamp
+                session_dir.mkdir(parents=True, exist_ok=True)
+                handler = logging.FileHandler(
+                    session_dir / "session.log",
+                    encoding="utf-8",
+                )
+                handler.setLevel(logging.INFO)
+                handler.setFormatter(logging.Formatter(LOG_FORMAT))
+            except OSError as error:
+                last_error = error
+                continue
+
+            logging.getLogger().addHandler(handler)
+            self.session_dir = session_dir
+            self._handler = handler
+            LOG.info("本次会话日志与诊断截图将保存到：%s", session_dir)
+            return session_dir
+
+        if last_error is not None:
+            raise last_error
+        raise OSError("无法创建会话日志目录")
+
+    def disable(self) -> None:
+        handler = self._handler
+        if handler is None:
+            self.session_dir = None
+            return
+        LOG.info("已停止保存本次会话日志与诊断截图")
+        logging.getLogger().removeHandler(handler)
+        handler.close()
+        self._handler = None
+        self.session_dir = None
+
+
+def log_runtime_environment() -> None:
+    LOG.info(
+        "运行环境：version=%s executable=%s python=%s os=%s",
+        __version__,
+        sys.executable,
+        platform.python_version(),
+        platform.platform(),
+    )
+    LOG.info("DPI 坐标模式：%s", awareness_name(DPI_AWARENESS))
 
 
 @dataclass(frozen=True)
@@ -120,13 +145,14 @@ def calibration_step_or_finish(index: int) -> tuple[str, CalibrationStep | None]
 
 
 class TaskbarHeroApp:
-    def __init__(self, root: tk.Tk, diagnostics_dir: Path | None = None) -> None:
+    def __init__(self, root: tk.Tk, session_logging: SessionLogging | None = None) -> None:
         self.root = root
-        self.diagnostics_dir = diagnostics_dir
+        self.session_logging = session_logging or SessionLogging()
+        self.diagnostics_dir: Path | None = None
         self.root.title("TBH 自动合成")
         self.ui_scale = max(1.0, float(self.root.winfo_fpixels("1i")) / 96.0)
         width = self._px(410)
-        height = self._px(340)
+        height = self._px(370)
         right_margin = self._px(20)
         top_margin = self._px(20)
         screen_width = self.root.winfo_screenwidth()
@@ -165,6 +191,7 @@ class TaskbarHeroApp:
         self.countdown_var = tk.StringVar(value="下一轮：准备立即执行")
         self.stats_var = tk.StringVar(value="已完成 0 轮，共合成 0 次")
         self.hotkey_warning_var = tk.StringVar(value="")
+        self.save_logs_var = tk.BooleanVar(value=False)
         self._build_ui()
 
         self.hotkeys = GlobalHotkeyListener(
@@ -235,6 +262,13 @@ class TaskbarHeroApp:
             side="left", expand=True, fill="x", padx=(self._px(4), 0)
         )
 
+        ttk.Checkbutton(
+            outer,
+            text="保存本次会话日志和诊断截图",
+            variable=self.save_logs_var,
+            command=self._toggle_session_logging,
+        ).pack(anchor="w", pady=(self._px(10), 0))
+
         ttk.Separator(outer).pack(fill="x", pady=self._px(12))
         ttk.Label(
             outer,
@@ -249,6 +283,23 @@ class TaskbarHeroApp:
             anchor="center",
             wraplength=self._px(370),
         ).pack(fill="x", pady=(self._px(4), 0))
+
+    def _toggle_session_logging(self) -> None:
+        if not self.save_logs_var.get():
+            self.session_logging.disable()
+            self.diagnostics_dir = None
+            return
+        try:
+            self.diagnostics_dir = self.session_logging.enable()
+            log_runtime_environment()
+        except OSError as error:
+            self.save_logs_var.set(False)
+            self.diagnostics_dir = None
+            messagebox.showerror(
+                "无法保存日志",
+                f"无法创建本次会话日志目录：{error}",
+                parent=self.root,
+            )
 
     def _show_hotkey_warning(self, message: str) -> None:
         current = self.hotkey_warning_var.get()
@@ -459,11 +510,14 @@ class TaskbarHeroApp:
         except Exception as error:
             LOG.exception("自动识别位置失败")
             failure_path = None
-            if image is not None and width > 0 and height > 0:
+            if (
+                self.diagnostics_dir is not None
+                and image is not None
+                and width > 0
+                and height > 0
+            ):
                 try:
-                    failure_path = (
-                        self.diagnostics_dir or runtime_output_dir()
-                    ) / "auto-detect-failure.bmp"
+                    failure_path = self.diagnostics_dir / "auto-detect-failure.bmp"
                     save_bgra_bmp(failure_path, image, width, height)
                     LOG.error("自动识别失败截图已保存：%s", failure_path)
                 except Exception:
@@ -641,19 +695,13 @@ class TaskbarHeroApp:
             return
         self.gate.request_shutdown()
         self.hotkeys.stop()
+        self.session_logging.disable()
         self.root.destroy()
 
 
 def main() -> None:
-    diagnostics_dir = configure_logging()
-    LOG.info(
-        "运行环境：version=%s executable=%s python=%s os=%s",
-        __version__,
-        sys.executable,
-        platform.python_version(),
-        platform.platform(),
-    )
-    LOG.info("DPI 坐标模式：%s", awareness_name(DPI_AWARENESS))
+    configure_logging()
+    log_runtime_environment()
     root = tk.Tk()
-    TaskbarHeroApp(root, diagnostics_dir)
+    TaskbarHeroApp(root)
     root.mainloop()
