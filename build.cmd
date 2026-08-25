@@ -18,9 +18,9 @@ if not exist "%ICON_PATH%" (
 )
 
 if exist "%VENV_PYTHON%" (
-    "%VENV_PYTHON%" -c "import tkinter" >nul 2>&1
+    "%VENV_PYTHON%" -c "from PyInstaller.utils.hooks.tcl_tk import tcltk_info; assert tcltk_info.available" >nul 2>&1
     if not errorlevel 1 goto :environment_ready
-    echo Existing build environment does not include Tkinter and must be recreated.
+    echo Existing build environment cannot package Tcl/Tk and must be recreated.
 )
 
 set "BASE_PYTHON="

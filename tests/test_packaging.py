@@ -40,6 +40,7 @@ class PackagingTests(unittest.TestCase):
         self.assertIn('--icon "%ICON_PATH%"', script)
         self.assertIn("Embedded icon mismatch", script)
         self.assertIn("The previous EXE was kept", script)
+        self.assertIn("assert tcltk_info.available", script)
         self.assertIn('findstr /c:"missing module named tkinter"', script)
         self.assertNotIn("build.ps1", script.lower())
         self.assertFalse((PROJECT_ROOT / "build.ps1").exists())
