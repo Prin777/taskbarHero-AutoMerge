@@ -24,7 +24,6 @@ auto-detect-failure.bmp
 
 # Synced project context and local publishing metadata
 sources/
-AGENTS.md
 .agents/
 .codex/
 .publish-repo/
