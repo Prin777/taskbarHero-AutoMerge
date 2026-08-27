@@ -21,6 +21,12 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 from .autodetect import layout_points_from_anchor
+from .desktop import (
+    SingleInstance,
+    SystemTray,
+    application_icon_path,
+    show_already_running_message,
+)
 from .engine import AutomationError, ControlGate, RoundCancelled, RunSchedule, SynthesisEngine
 from .model import AppConfig, Calibration, Point, WindowIdentity, default_app_dir
 from .windows import (
@@ -150,6 +156,10 @@ class TaskbarHeroApp:
         self.session_logging = session_logging or SessionLogging()
         self.diagnostics_dir: Path | None = None
         self.root.title("TBH 自动合成")
+        try:
+            self.root.iconbitmap(default=str(application_icon_path()))
+        except tk.TclError:
+            LOG.warning("无法设置主窗口图标", exc_info=True)
         self.ui_scale = max(1.0, float(self.root.winfo_fpixels("1i")) / 96.0)
         width = self._px(410)
         height = self._px(370)
@@ -162,7 +172,7 @@ class TaskbarHeroApp:
         )
         self.root.resizable(False, False)
         self.root.attributes("-topmost", True)
-        self.root.protocol("WM_DELETE_WINDOW", self.close)
+        self.root.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
 
         self._config_load_error = ""
         try:
@@ -179,6 +189,7 @@ class TaskbarHeroApp:
         self.total_combinations = 0
         self._worker: threading.Thread | None = None
         self._auto_detecting = False
+        self._exiting = False
 
         self._wizard: tk.Toplevel | None = None
         self._calibration_index = 0
@@ -193,6 +204,12 @@ class TaskbarHeroApp:
         self.hotkey_warning_var = tk.StringVar(value="")
         self.save_logs_var = tk.BooleanVar(value=False)
         self._build_ui()
+
+        self.tray = SystemTray(
+            on_show=lambda: self.ui_queue.put(("tray_show", None)),
+            on_exit=lambda: self.ui_queue.put(("tray_exit", None)),
+        )
+        self.tray.start()
 
         self.hotkeys = GlobalHotkeyListener(
             on_f7=lambda: self.root.after(0, self._capture_calibration_point),
@@ -332,6 +349,10 @@ class TaskbarHeroApp:
                 elif kind == "error":
                     self._set_status("已安全暂停", str(payload), "#b3261e")
                     self.toggle_button.configure(text="开启托管 (F8)")
+                elif kind == "tray_show":
+                    self.show_main_window()
+                elif kind == "tray_exit":
+                    self.exit_application()
         except queue.Empty:
             pass
         if not self.gate.shutdown_requested:
@@ -690,18 +711,45 @@ class TaskbarHeroApp:
         else:
             self._set_status("需要校准", "没有有效配置，不会执行鼠标操作", "#b7791f")
 
-    def close(self) -> None:
-        if not messagebox.askokcancel("退出", "确定退出 TBH 自动合成工具吗？"):
+    def hide_to_tray(self) -> None:
+        """Window close keeps automation alive and hides only the UI."""
+        if self._wizard is not None and self._wizard.winfo_exists():
+            self._wizard.withdraw()
+        self.root.withdraw()
+
+    def show_main_window(self) -> None:
+        if self._exiting:
             return
+        self.root.deiconify()
+        self.root.state("normal")
+        self.root.lift()
+        self.root.focus_force()
+        if self._wizard is not None and self._wizard.winfo_exists():
+            self._wizard.deiconify()
+            self._wizard.lift()
+
+    def exit_application(self) -> None:
+        """Fully stop the app when the tray's exit command is selected."""
+        if self._exiting:
+            return
+        self._exiting = True
         self.gate.request_shutdown()
         self.hotkeys.stop()
         self.session_logging.disable()
+        self.tray.stop()
         self.root.destroy()
 
 
 def main() -> None:
     configure_logging()
     log_runtime_environment()
-    root = tk.Tk()
-    TaskbarHeroApp(root)
-    root.mainloop()
+    instance = SingleInstance()
+    if not instance.acquire():
+        show_already_running_message()
+        return
+    try:
+        root = tk.Tk()
+        TaskbarHeroApp(root)
+        root.mainloop()
+    finally:
+        instance.release()

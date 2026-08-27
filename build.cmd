@@ -60,8 +60,13 @@ if errorlevel 1 (
     "%VENV_PYTHON%" -m pip install --disable-pip-version-check pyinstaller
     if errorlevel 1 goto :fail
 )
+"%VENV_PYTHON%" -c "import PIL, pystray" >nul 2>&1
+if errorlevel 1 (
+    "%VENV_PYTHON%" -m pip install --disable-pip-version-check -r requirements.txt
+    if errorlevel 1 goto :fail
+)
 
-"%VENV_PYTHON%" -m PyInstaller --noconfirm --clean --onefile --windowed --name "TBH-AutoSynth" --icon "%ICON_PATH%" --distpath "%PENDING_ROOT%\dist" --workpath "%PENDING_ROOT%\work" --specpath "%PENDING_ROOT%\spec" "taskbar_hero.py"
+"%VENV_PYTHON%" -m PyInstaller --noconfirm --clean --onefile --windowed --name "TBH-AutoSynth" --icon "%ICON_PATH%" --add-data "%ICON_PATH%;assets" --distpath "%PENDING_ROOT%\dist" --workpath "%PENDING_ROOT%\work" --specpath "%PENDING_ROOT%\spec" "taskbar_hero.py"
 if errorlevel 1 goto :fail
 if not exist "%PENDING_EXE%" (
     echo [ERROR] PyInstaller did not produce the expected executable.
