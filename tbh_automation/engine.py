@@ -27,6 +27,7 @@ class RunSchedule:
 
     interval_seconds: float
     next_due: float
+    last_completed_at: float | None = None
 
     @classmethod
     def starting_now(cls, interval_seconds: float, now: float) -> "RunSchedule":
@@ -36,10 +37,17 @@ class RunSchedule:
         return now >= self.next_due
 
     def complete_round(self, now: float) -> None:
+        self.last_completed_at = now
         self.next_due = now + self.interval_seconds
 
     def run_now(self, now: float) -> None:
         self.next_due = now
+
+    def change_interval(self, interval_seconds: float) -> None:
+        """Apply a new interval without postponing the initial immediate run."""
+        self.interval_seconds = interval_seconds
+        if self.last_completed_at is not None:
+            self.next_due = self.last_completed_at + interval_seconds
 
 
 class AutomationDriver(Protocol):

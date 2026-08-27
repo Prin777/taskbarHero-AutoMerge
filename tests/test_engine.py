@@ -135,6 +135,22 @@ class RunScheduleTests(unittest.TestCase):
         self.assertFalse(schedule.is_due(18_249.9))
         self.assertTrue(schedule.is_due(18_250.0))
 
+    def test_changed_interval_recalculates_from_last_completed_round(self) -> None:
+        schedule = RunSchedule.starting_now(18_000, 100.0)
+        schedule.complete_round(250.0)
+
+        schedule.change_interval(3_600)
+
+        self.assertEqual(schedule.interval_seconds, 3_600)
+        self.assertEqual(schedule.next_due, 3_850.0)
+
+    def test_changed_interval_does_not_postpone_initial_run(self) -> None:
+        schedule = RunSchedule.starting_now(18_000, 100.0)
+
+        schedule.change_interval(3_600)
+
+        self.assertEqual(schedule.next_due, 100.0)
+
 
 if __name__ == "__main__":
     unittest.main()

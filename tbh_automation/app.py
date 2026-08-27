@@ -44,6 +44,24 @@ from .windows import (
 
 LOG = logging.getLogger("tbh_automation")
 LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
+INTERVAL_OPTIONS = {
+    "1h": 1 * 60 * 60,
+    "2h": 2 * 60 * 60,
+    "3h": 3 * 60 * 60,
+    "5h": 5 * 60 * 60,
+}
+
+
+def interval_option_for_seconds(seconds: int | float) -> str:
+    for option, option_seconds in INTERVAL_OPTIONS.items():
+        if seconds == option_seconds:
+            return option
+    return f"{seconds / 3600:g}h"
+
+
+def interval_description(seconds: int | float) -> str:
+    hours = seconds / 3600
+    return f"{hours:g} 小时"
 
 
 def scaled_pixels(value: int, scale: float) -> int:
@@ -162,7 +180,7 @@ class TaskbarHeroApp:
             LOG.warning("无法设置主窗口图标", exc_info=True)
         self.ui_scale = max(1.0, float(self.root.winfo_fpixels("1i")) / 96.0)
         width = self._px(410)
-        height = self._px(370)
+        height = self._px(400)
         right_margin = self._px(20)
         top_margin = self._px(20)
         screen_width = self.root.winfo_screenwidth()
@@ -201,6 +219,9 @@ class TaskbarHeroApp:
         self.detail_var = tk.StringVar(value="")
         self.countdown_var = tk.StringVar(value="下一轮：准备立即执行")
         self.stats_var = tk.StringVar(value="已完成 0 轮，共合成 0 次")
+        self.interval_var = tk.StringVar(
+            value=interval_option_for_seconds(self.config.interval_seconds)
+        )
         self.hotkey_warning_var = tk.StringVar(value="")
         self.save_logs_var = tk.BooleanVar(value=False)
         self._build_ui()
@@ -257,7 +278,23 @@ class TaskbarHeroApp:
             fill="x", pady=self._px(2)
         )
         ttk.Label(outer, textvariable=self.stats_var, anchor="center").pack(
-            fill="x", pady=(self._px(2), self._px(10))
+            fill="x", pady=(self._px(2), self._px(6))
+        )
+
+        interval_row = ttk.Frame(outer)
+        interval_row.pack(fill="x", pady=(0, self._px(8)))
+        ttk.Label(interval_row, text="下一轮间隔：").pack(side="left")
+        interval_picker = ttk.Combobox(
+            interval_row,
+            textvariable=self.interval_var,
+            values=tuple(INTERVAL_OPTIONS),
+            state="readonly",
+            width=7,
+        )
+        interval_picker.pack(side="left")
+        interval_picker.bind("<<ComboboxSelected>>", self._change_interval)
+        ttk.Label(interval_row, text="选择后自动保存", foreground="#666666").pack(
+            side="left", padx=(self._px(8), 0)
         )
 
         buttons = ttk.Frame(outer)
@@ -318,6 +355,32 @@ class TaskbarHeroApp:
                 parent=self.root,
             )
 
+    def _change_interval(self, _event: object | None = None) -> None:
+        option = self.interval_var.get()
+        if option not in INTERVAL_OPTIONS:
+            return
+        interval_seconds = INTERVAL_OPTIONS[option]
+        previous_seconds = self.config.interval_seconds
+        if interval_seconds == previous_seconds:
+            return
+
+        self.config.interval_seconds = interval_seconds
+        try:
+            self.config.save()
+        except OSError as error:
+            self.config.interval_seconds = previous_seconds
+            self.interval_var.set(interval_option_for_seconds(previous_seconds))
+            messagebox.showerror(
+                "无法保存设置",
+                f"无法保存下一轮执行间隔：{error}",
+                parent=self.root,
+            )
+            return
+
+        self.schedule.change_interval(interval_seconds)
+        LOG.info("下一轮执行间隔已调整为：%s", interval_description(interval_seconds))
+        self._update_countdown_text(time.monotonic())
+
     def _show_hotkey_warning(self, message: str) -> None:
         current = self.hotkey_warning_var.get()
         self.hotkey_warning_var.set(f"{current}\n{message}".strip())
@@ -359,19 +422,22 @@ class TaskbarHeroApp:
             self.root.after(100, self._poll_ui_queue)
 
     def _tick_countdown(self) -> None:
+        self._update_countdown_text(time.monotonic())
+        if not self.gate.shutdown_requested:
+            self.root.after(1000, self._tick_countdown)
+
+    def _update_countdown_text(self, now: float) -> None:
         if self.config.calibration is None:
             self.countdown_var.set("完成校准后立即执行第一轮")
         elif not self.gate.enabled:
             self.countdown_var.set("托管已暂停")
         else:
-            remaining = max(0, round(self.schedule.next_due - time.monotonic()))
+            remaining = max(0, round(self.schedule.next_due - now))
             if remaining == 0:
                 self.countdown_var.set("下一轮：已到时间，正在等待游戏启动")
             else:
                 duration = str(timedelta(seconds=remaining))
                 self.countdown_var.set(f"下一轮倒计时：{duration}")
-        if not self.gate.shutdown_requested:
-            self.root.after(1000, self._tick_countdown)
 
     def _start_worker(self) -> None:
         self._worker = threading.Thread(target=self._scheduler_loop, name="automation-worker", daemon=True)
@@ -422,7 +488,9 @@ class TaskbarHeroApp:
                 continue
             self.ui_queue.put(("round", result.total))
             self.schedule.complete_round(time.monotonic())
-            self._post_status("本轮完成，等待五小时后执行下一轮")
+            self._post_status(
+                f"本轮完成，等待 {interval_description(self.schedule.interval_seconds)}后执行下一轮"
+            )
 
     def toggle_enabled(self) -> None:
         if self._auto_detecting or (self._wizard is not None and self._wizard.winfo_exists()):
