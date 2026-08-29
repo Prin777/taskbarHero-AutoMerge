@@ -9,6 +9,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 class PackagingTests(unittest.TestCase):
+    def test_icon_master_is_a_256_pixel_png(self) -> None:
+        master_path = PROJECT_ROOT / "assets" / "taskbar-hero-master.png"
+        data = master_path.read_bytes()
+        self.assertEqual(data[:8], b"\x89PNG\r\n\x1a\n")
+        self.assertEqual(struct.unpack_from(">II", data, 16), (256, 256))
+
     def test_embedded_icon_asset_contains_all_expected_sizes(self) -> None:
         icon_path = PROJECT_ROOT / "assets" / "taskbar-hero.ico"
         data = icon_path.read_bytes()
