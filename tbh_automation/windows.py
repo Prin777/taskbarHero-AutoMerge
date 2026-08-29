@@ -68,6 +68,12 @@ COMBINE_BUTTON_CONFIRMATIONS = 2
 COMBINE_BUTTON_CONFIRM_INTERVAL_SECONDS = 0.20
 COMBINE_BUTTON_INITIAL_WAIT_SECONDS = 0.65
 COMBINE_BUTTON_ACTIVATION_TIMEOUT_SECONDS = 3.0
+GAME_ACTIVATION_TIMEOUT_SECONDS = 3.0
+GAME_ACTIVATION_RETRY_SECONDS = 0.20
+
+
+class GameActivationError(AutomationError):
+    """The verified game window exists but is not ready to become foreground."""
 
 
 class BITMAPINFOHEADER(ctypes.Structure):
@@ -429,30 +435,50 @@ def _topmost_obstructions_above(hwnd: int) -> list[int]:
 
 
 @contextmanager
-def temporarily_uncover_window(hwnd: int, *, report_obstruction: bool = False) -> Iterator[None]:
+def temporarily_uncover_window(
+    hwnd: int,
+    *,
+    report_obstruction: bool = False,
+    wait: Callable[[float], None] | None = None,
+) -> Iterator[None]:
     """截图或点击前真正激活并置顶游戏，避免置顶终端污染桌面取图。"""
+    pause = wait or time.sleep
     was_topmost = bool(user32.GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST)
+    lowered_windows: list[int] = []
     if user32.IsIconic(hwnd):
         user32.ShowWindow(hwnd, SW_RESTORE)
-        time.sleep(0.15)
+        pause(0.15)
         LOG.info("自动界面准备：已从最小化状态恢复 TaskBarHero")
     if report_obstruction and not client_area_is_uncovered(hwnd):
         LOG.warning("检测到游戏窗口被遮挡，采集期间将激活并临时置于最上层")
     activate_flags = SWP_NOMOVE | SWP_NOSIZE
     restore_flags = activate_flags | SWP_NOACTIVATE
-    if not user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, activate_flags):
-        raise ctypes.WinError(ctypes.get_last_error())
-    user32.BringWindowToTop(hwnd)
-    user32.SetForegroundWindow(hwnd)
-    # 给 DWM 和 Unity 两个刷新周期，确保桌面画面已经切换到游戏。
-    time.sleep(0.15)
-    lowered_windows: list[int] = []
     try:
-        if get_foreground_root() != _root_window(hwnd):
-            message = "无法把游戏窗口激活到前台，请先手动点击游戏后重试"
-            if report_obstruction:
-                raise ValueError(message)
-            raise AutomationError(message)
+        activation_deadline = time.monotonic() + GAME_ACTIVATION_TIMEOUT_SECONDS
+        activation_attempt = 0
+        while True:
+            activation_attempt += 1
+            if not user32.SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                activate_flags,
+            ):
+                raise ctypes.WinError(ctypes.get_last_error())
+            user32.BringWindowToTop(hwnd)
+            user32.SetForegroundWindow(hwnd)
+            # Unity 冷启动时窗口可能已枚举出来，但还要数个刷新周期才能接管前台。
+            pause(0.15 if activation_attempt == 1 else GAME_ACTIVATION_RETRY_SECONDS)
+            if get_foreground_root() == _root_window(hwnd):
+                break
+            if time.monotonic() >= activation_deadline:
+                raise GameActivationError(
+                    "游戏窗口已经找到，但暂时无法激活到前台，请先手动点击游戏"
+                )
+            LOG.info("游戏窗口尚未接管前台，正在重试激活（第 %d 次）", activation_attempt + 1)
         # 某些置顶终端即使不处于前台，也会继续覆盖透明的 Unity 游戏窗口。
         # 在截图/点击期间临时取消其置顶，退出上下文时恢复原状态。
         for _attempt in range(2):
@@ -482,7 +508,7 @@ def temporarily_uncover_window(hwnd: int, *, report_obstruction: bool = False) -
                     lowered_windows.append(candidate)
             user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, activate_flags)
             user32.BringWindowToTop(hwnd)
-            time.sleep(0.08)
+            pause(0.08)
         remaining = _topmost_obstructions_above(hwnd)
         if remaining:
             covering = remaining[0]
@@ -502,9 +528,17 @@ def temporarily_uncover_window(hwnd: int, *, report_obstruction: bool = False) -
                 user32.SetWindowPos(candidate, HWND_TOPMOST, 0, 0, 0, 0, restore_flags)
 
 
-def press_tab_on_game(hwnd: int) -> None:
+def press_tab_on_game(
+    hwnd: int,
+    *,
+    wait: Callable[[float], None] | None = None,
+) -> None:
     """激活已经严格识别的游戏窗口，并发送一次英雄菜单快捷键。"""
-    with temporarily_uncover_window(hwnd, report_obstruction=True):
+    with temporarily_uncover_window(
+        hwnd,
+        report_obstruction=True,
+        wait=wait,
+    ):
         if get_foreground_root() != _root_window(hwnd):
             raise ValueError("无法激活游戏，未发送 Tab")
         user32.keybd_event(VK_TAB, 0, 0, 0)
@@ -512,15 +546,26 @@ def press_tab_on_game(hwnd: int) -> None:
         LOG.info("自动界面准备：已向 TaskBarHero 发送 Tab，打开英雄背包")
 
 
-def click_game_point(hwnd: int, point: Point, label: str) -> None:
+def click_game_point(
+    hwnd: int,
+    point: Point,
+    label: str,
+    *,
+    wait: Callable[[float], None] | None = None,
+) -> None:
     """校准前只允许在已识别游戏客户区的可见位置执行一次安全点击。"""
-    with temporarily_uncover_window(hwnd, report_obstruction=True):
+    pause = wait or time.sleep
+    with temporarily_uncover_window(
+        hwnd,
+        report_obstruction=True,
+        wait=pause,
+    ):
         screen = client_to_screen(hwnd, point)
         if not point_is_safe_on_active_game(hwnd, screen):
             raise ValueError(f"{label}被其他窗口遮挡，未执行点击")
         if not user32.SetCursorPos(screen.x, screen.y):
             raise ValueError(f"无法移动鼠标到{label}")
-        time.sleep(CURSOR_SETTLE_SECONDS)
+        pause(CURSOR_SETTLE_SECONDS)
         if get_foreground_root() != _root_window(hwnd) or not point_is_safe_on_active_game(
             hwnd,
             screen,
@@ -582,14 +627,22 @@ def open_synthesis_interface(
     hwnd: int,
     *,
     wait: Callable[[float], None] | None = None,
+    checkpoint: Callable[[], None] | None = None,
     diagnostics_dir: Path | None = None,
 ) -> tuple[bytes, int, int, AutoDetectionResult]:
     """必要时打开英雄背包和魔方，并返回自动填充文字的识别结果。"""
     pause = wait or time.sleep
+    ensure_active = checkpoint or (lambda: None)
 
     def capture(stage: str) -> tuple[bytes, int, int]:
-        with temporarily_uncover_window(hwnd, report_obstruction=True):
+        ensure_active()
+        with temporarily_uncover_window(
+            hwnd,
+            report_obstruction=True,
+            wait=pause,
+        ):
             image, width, height = capture_client_bgra(hwnd)
+        ensure_active()
         if diagnostics_dir is not None:
             try:
                 dpi = get_window_dpi(hwnd)
@@ -632,25 +685,33 @@ def open_synthesis_interface(
         width: int,
         height: int,
     ) -> AutoDetectionResult:
+        ensure_active()
         dpi = get_window_dpi(hwnd)
-        return find_auto_fill_anchor(
+        result = find_auto_fill_anchor(
             image,
             width,
             height,
             preferred_scale=dpi / 96,
             require_button_color=True,
         )
+        ensure_active()
+        return result
 
     image, width, height = capture("initial")
+    ensure_active()
     try:
         cube = find_cube_icon(image, width, height)
+        ensure_active()
         LOG.info("英雄背包已打开：识别到魔方入口 %s", cube)
     except ValueError:
         LOG.info("当前未显示英雄背包，开始自动准备界面")
-        press_tab_on_game(hwnd)
+        ensure_active()
+        press_tab_on_game(hwnd, wait=pause)
         pause(1.0)
         image, width, height = capture("after-tab")
+        ensure_active()
         cube = find_cube_icon(image, width, height)
+        ensure_active()
         LOG.info("按 Tab 后识别到魔方入口：%s", cube)
     else:
         try:
@@ -658,7 +719,8 @@ def open_synthesis_interface(
         except ValueError:
             LOG.info("英雄背包已打开，但当前未显示魔方合成窗口")
 
-    click_game_point(hwnd, cube.center, "黄色魔方入口")
+    ensure_active()
+    click_game_point(hwnd, cube.center, "黄色魔方入口", wait=pause)
     pause(1.2)
     image, width, height = capture("after-cube-click")
     # 无法识别自动填充时直接安全失败。再次点击同一入口可能把已经打开的
@@ -824,19 +886,25 @@ class Win32AutomationDriver:
             self.gate.wait_enabled(self.generation, 0.25)
 
     def prepare_interface(self) -> None:
-        self.checkpoint()
-        hwnd = self._foreground()
-        try:
-            _image, width, height, result = open_synthesis_interface(
-                hwnd,
-                wait=lambda seconds: self.gate.interruptible_wait(
-                    seconds,
-                    self.generation,
-                ),
-                diagnostics_dir=getattr(self, "diagnostics_dir", None),
-            )
-        except ValueError as error:
-            raise AutomationError(f"自动准备游戏界面失败：{error}") from error
+        while True:
+            self.checkpoint()
+            hwnd = self._foreground()
+            try:
+                _image, width, height, result = open_synthesis_interface(
+                    hwnd,
+                    wait=lambda seconds: self.gate.interruptible_wait(
+                        seconds,
+                        self.generation,
+                    ),
+                    checkpoint=self.checkpoint,
+                    diagnostics_dir=getattr(self, "diagnostics_dir", None),
+                )
+                break
+            except GameActivationError:
+                self.status("已找到 TaskBarHero，正在等待游戏窗口可以激活")
+                self.gate.interruptible_wait(0.5, self.generation)
+            except ValueError as error:
+                raise AutomationError(f"自动准备游戏界面失败：{error}") from error
         if (width, height) != (
             self.calibration.window.client_width,
             self.calibration.window.client_height,
@@ -855,7 +923,13 @@ class Win32AutomationDriver:
     def _click(self, key: str) -> None:
         self.checkpoint()
         hwnd = self._foreground()
-        with temporarily_uncover_window(hwnd):
+        with temporarily_uncover_window(
+            hwnd,
+            wait=lambda seconds: self.gate.interruptible_wait(
+                seconds,
+                self.generation,
+            ),
+        ):
             screen = client_to_screen(hwnd, self.calibration.points[key])
             if not point_is_safe_on_active_game(hwnd, screen):
                 raise AutomationError("游戏操作区域被其他窗口遮挡，请移开遮挡窗口后重新开启")
@@ -908,7 +982,13 @@ class Win32AutomationDriver:
     def _combine_button_ratio_once(self) -> tuple[float, bytes]:
         self.checkpoint()
         hwnd = self._foreground()
-        with temporarily_uncover_window(hwnd):
+        with temporarily_uncover_window(
+            hwnd,
+            wait=lambda seconds: self.gate.interruptible_wait(
+                seconds,
+                self.generation,
+            ),
+        ):
             center = self.calibration.points["combine"]
             screen = client_to_screen(hwnd, center)
             if not point_is_safe_on_active_game(hwnd, screen):

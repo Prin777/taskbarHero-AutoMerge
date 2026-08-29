@@ -205,6 +205,13 @@ class ControlGate:
             self._enabled = True
             self._condition.notify_all()
 
+    def restart(self) -> None:
+        """Cancel any in-flight round and immediately allow a fresh one."""
+        with self._condition:
+            self._enabled = True
+            self._generation += 1
+            self._condition.notify_all()
+
     def pause(self, *, cancel_round: bool = False) -> None:
         with self._condition:
             self._enabled = False

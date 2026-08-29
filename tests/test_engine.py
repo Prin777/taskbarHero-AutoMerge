@@ -122,6 +122,18 @@ class ControlGateTests(unittest.TestCase):
         self.assertTrue(gate.toggle())
         gate.wait_enabled(gate.generation, 0)
 
+    def test_restart_cancels_old_round_and_keeps_automation_enabled(self) -> None:
+        gate = ControlGate()
+        old_generation = gate.generation
+
+        gate.restart()
+
+        self.assertTrue(gate.enabled)
+        self.assertGreater(gate.generation, old_generation)
+        with self.assertRaises(RoundCancelled):
+            gate.wait_enabled(old_generation, 0)
+        gate.wait_enabled(gate.generation, 0)
+
 
 class RunScheduleTests(unittest.TestCase):
     def test_startup_is_immediately_due(self) -> None:

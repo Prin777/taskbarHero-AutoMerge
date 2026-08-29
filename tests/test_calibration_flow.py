@@ -12,6 +12,7 @@ from tbh_automation.app import (
     SessionLogging,
     TaskbarHeroApp,
     calibration_step_or_finish,
+    format_interval_remaining,
     interval_option_for_seconds,
     runtime_output_dir,
     scaled_pixels,
@@ -36,6 +37,45 @@ class CalibrationFlowTests(unittest.TestCase):
         )
         self.assertEqual(interval_option_for_seconds(10_800), "3h")
         self.assertEqual(interval_option_for_seconds(12_345), "3.42917h")
+
+    def test_interval_remaining_is_always_formatted_as_hh_mm_ss(self) -> None:
+        self.assertEqual(format_interval_remaining(0), "00:00:00")
+        self.assertEqual(format_interval_remaining(3_661), "01:01:01")
+        self.assertEqual(format_interval_remaining(18_000), "05:00:00")
+
+    def test_waiting_interval_is_shown_in_a_distinct_blue_status_bar(self) -> None:
+        app = object.__new__(TaskbarHeroApp)
+        app._auto_detecting = False
+        app.config = Mock(calibration=object())
+        app.gate = Mock(enabled=True)
+        app.round_active_event = Mock()
+        app.round_active_event.is_set.return_value = False
+        app.schedule = Mock(next_due=3_661.0)
+        app.detail_var = Mock()
+        app.detail_var.get.return_value = "本轮完成"
+        app._set_status = Mock()
+
+        app._update_countdown_text(0.0)
+
+        app._set_status.assert_called_once_with(
+            "循环间隔剩余 01:01:01",
+            "本轮完成",
+            "#1a73e8",
+        )
+
+    def test_active_round_status_is_not_overwritten_by_interval_countdown(self) -> None:
+        app = object.__new__(TaskbarHeroApp)
+        app._auto_detecting = False
+        app.config = Mock(calibration=object())
+        app.gate = Mock(enabled=True)
+        app.round_active_event = Mock()
+        app.round_active_event.is_set.return_value = True
+        app.schedule = Mock(next_due=3_661.0)
+        app._set_status = Mock()
+
+        app._update_countdown_text(0.0)
+
+        app._set_status.assert_not_called()
 
     def test_changing_interval_saves_config_and_updates_schedule(self) -> None:
         app = object.__new__(TaskbarHeroApp)

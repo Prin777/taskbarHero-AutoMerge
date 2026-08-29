@@ -7,7 +7,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 from . import __version__
@@ -62,6 +62,13 @@ def interval_option_for_seconds(seconds: int | float) -> str:
 def interval_description(seconds: int | float) -> str:
     hours = seconds / 3600
     return f"{hours:g} 小时"
+
+
+def format_interval_remaining(seconds: int | float) -> str:
+    remaining = max(0, round(seconds))
+    hours, remainder = divmod(remaining, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
 def scaled_pixels(value: int, scale: float) -> int:
@@ -152,6 +159,16 @@ class CalibrationStep:
     instruction: str
 
 
+@dataclass(frozen=True)
+class AutoDetectionOutcome:
+    cancel_event: threading.Event
+    previous_calibration: Calibration | None
+    calibration: Calibration | None = None
+    error: str = ""
+    failure_path: Path | None = None
+    cancelled: bool = False
+
+
 CALIBRATION_STEPS = [
     CalibrationStep("auto_fill", "自动填充按钮", "把鼠标放在“自动填充”按钮中央，然后按 F7。"),
     CalibrationStep("category_dropdown", "类别下拉箭头", "把鼠标放在“自动填充”右侧的小箭头上，然后按 F7。"),
@@ -180,7 +197,7 @@ class TaskbarHeroApp:
             LOG.warning("无法设置主窗口图标", exc_info=True)
         self.ui_scale = max(1.0, float(self.root.winfo_fpixels("1i")) / 96.0)
         width = self._px(410)
-        height = self._px(400)
+        height = self._px(445)
         right_margin = self._px(20)
         top_margin = self._px(20)
         screen_width = self.root.winfo_screenwidth()
@@ -202,11 +219,15 @@ class TaskbarHeroApp:
         self.gate = ControlGate()
         self.ui_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.run_now_event = threading.Event()
+        self.round_active_event = threading.Event()
+        self._automation_lock = threading.Lock()
         self.schedule = RunSchedule.starting_now(self.config.interval_seconds, time.monotonic())
         self.total_rounds = 0
         self.total_combinations = 0
         self._worker: threading.Thread | None = None
         self._auto_detecting = False
+        self._auto_detection_thread: threading.Thread | None = None
+        self._auto_detection_cancel: threading.Event | None = None
         self._exiting = False
 
         self._wizard: tk.Toplevel | None = None
@@ -217,7 +238,6 @@ class TaskbarHeroApp:
 
         self.status_var = tk.StringVar(value="正在启动")
         self.detail_var = tk.StringVar(value="")
-        self.countdown_var = tk.StringVar(value="下一轮：准备立即执行")
         self.stats_var = tk.StringVar(value="已完成 0 轮，共合成 0 次")
         self.interval_var = tk.StringVar(
             value=interval_option_for_seconds(self.config.interval_seconds)
@@ -256,6 +276,19 @@ class TaskbarHeroApp:
         return scaled_pixels(value, self.ui_scale)
 
     def _build_ui(self) -> None:
+        self.footer_status_label = tk.Label(
+            self.root,
+            textvariable=self.detail_var,
+            anchor="w",
+            bg="#f0f0f0",
+            fg="#333333",
+            relief="sunken",
+            bd=1,
+            padx=self._px(7),
+            pady=self._px(4),
+        )
+        self.footer_status_label.pack(side="bottom", fill="x")
+
         outer = ttk.Frame(self.root, padding=self._px(14))
         outer.pack(fill="both", expand=True)
 
@@ -268,17 +301,15 @@ class TaskbarHeroApp:
             pady=self._px(9),
         )
         self.status_label.pack(fill="x")
-        ttk.Label(
+        self.stats_label = ttk.Label(
             outer,
-            textvariable=self.detail_var,
+            textvariable=self.stats_var,
             anchor="center",
-            wraplength=self._px(370),
-        ).pack(fill="x", pady=(self._px(8), self._px(2)))
-        ttk.Label(outer, textvariable=self.countdown_var, anchor="center").pack(
-            fill="x", pady=self._px(2)
+            font=("Microsoft YaHei UI", 12, "bold"),
         )
-        ttk.Label(outer, textvariable=self.stats_var, anchor="center").pack(
-            fill="x", pady=(self._px(2), self._px(6))
+        self.stats_label.pack(
+            fill="x",
+            pady=(self._px(10), self._px(8)),
         )
 
         interval_row = ttk.Frame(outer)
@@ -301,18 +332,27 @@ class TaskbarHeroApp:
         buttons.pack(fill="x")
         self.toggle_button = ttk.Button(buttons, text="暂停托管 (F8)", command=self.toggle_enabled)
         self.toggle_button.pack(side="left", expand=True, fill="x", padx=(0, self._px(4)))
-        ttk.Button(buttons, text="立即执行", command=self.run_now).pack(
+        self.run_now_button = ttk.Button(buttons, text="立即执行", command=self.run_now)
+        self.run_now_button.pack(
             side="left", expand=True, fill="x", padx=(self._px(4), 0)
         )
 
         calibration_buttons = ttk.Frame(outer)
         calibration_buttons.pack(fill="x", pady=(self._px(7), 0))
-        ttk.Button(
+        self.auto_detection_button = ttk.Button(
             calibration_buttons,
             text="自动识别位置",
             command=self.start_auto_detection,
-        ).pack(side="left", expand=True, fill="x", padx=(0, self._px(4)))
-        ttk.Button(calibration_buttons, text="手动校准", command=self.start_calibration).pack(
+        )
+        self.auto_detection_button.pack(
+            side="left", expand=True, fill="x", padx=(0, self._px(4))
+        )
+        self.manual_calibration_button = ttk.Button(
+            calibration_buttons,
+            text="手动校准",
+            command=self.start_calibration,
+        )
+        self.manual_calibration_button.pack(
             side="left", expand=True, fill="x", padx=(self._px(4), 0)
         )
 
@@ -322,6 +362,13 @@ class TaskbarHeroApp:
             variable=self.save_logs_var,
             command=self._toggle_session_logging,
         ).pack(anchor="w", pady=(self._px(10), 0))
+
+        self.exit_button = ttk.Button(
+            outer,
+            text="关闭自动化程序",
+            command=self.exit_application,
+        )
+        self.exit_button.pack(fill="x", pady=(self._px(9), 0))
 
         ttk.Separator(outer).pack(fill="x", pady=self._px(12))
         ttk.Label(
@@ -416,6 +463,16 @@ class TaskbarHeroApp:
                     self.show_main_window()
                 elif kind == "tray_exit":
                     self.exit_application()
+                elif kind == "auto_detection_finished":
+                    self._finish_auto_detection(payload)
+                elif kind == "auto_detection_status":
+                    if (
+                        isinstance(payload, tuple)
+                        and len(payload) == 2
+                        and payload[0] is self._auto_detection_cancel
+                        and not payload[0].is_set()
+                    ):
+                        self._set_status("正在自动识别", str(payload[1]), "#b7791f")
         except queue.Empty:
             pass
         if not self.gate.shutdown_requested:
@@ -427,17 +484,22 @@ class TaskbarHeroApp:
             self.root.after(1000, self._tick_countdown)
 
     def _update_countdown_text(self, now: float) -> None:
-        if self.config.calibration is None:
-            self.countdown_var.set("完成校准后立即执行第一轮")
-        elif not self.gate.enabled:
-            self.countdown_var.set("托管已暂停")
-        else:
-            remaining = max(0, round(self.schedule.next_due - now))
-            if remaining == 0:
-                self.countdown_var.set("下一轮：已到时间，正在等待游戏启动")
-            else:
-                duration = str(timedelta(seconds=remaining))
-                self.countdown_var.set(f"下一轮倒计时：{duration}")
+        if (
+            self._auto_detecting
+            or self.config.calibration is None
+            or not self.gate.enabled
+            or self.round_active_event.is_set()
+        ):
+            return
+        remaining = max(0, round(self.schedule.next_due - now))
+        if remaining == 0:
+            return
+        duration = format_interval_remaining(remaining)
+        self._set_status(
+            f"循环间隔剩余 {duration}",
+            self.detail_var.get(),
+            "#1a73e8",
+        )
 
     def _start_worker(self) -> None:
         self._worker = threading.Thread(target=self._scheduler_loop, name="automation-worker", daemon=True)
@@ -471,8 +533,10 @@ class TaskbarHeroApp:
                 logger=LOG,
                 status=self._post_status,
             )
+            self.round_active_event.set()
             try:
-                result = engine.run_round()
+                with self._automation_lock:
+                    result = engine.run_round()
             except RoundCancelled:
                 LOG.info("本轮已取消")
                 continue
@@ -486,6 +550,8 @@ class TaskbarHeroApp:
                 self.gate.pause(cancel_round=True)
                 self.ui_queue.put(("error", f"发生异常：{error}"))
                 continue
+            finally:
+                self.round_active_event.clear()
             self.ui_queue.put(("round", result.total))
             self.schedule.complete_round(time.monotonic())
             self._post_status(
@@ -504,17 +570,27 @@ class TaskbarHeroApp:
             self._set_status("已暂停", "不会执行任何鼠标操作", "#666666")
 
     def emergency_stop(self) -> None:
-        if self._auto_detecting or (self._wizard is not None and self._wizard.winfo_exists()):
+        if self._auto_detecting:
+            cancel_event = self._auto_detection_cancel
+            if cancel_event is not None:
+                cancel_event.set()
+            self._set_status("正在停止", "正在安全取消自动识别，请稍候", "#b3261e")
+            return
+        if self._wizard is not None and self._wizard.winfo_exists():
             return
         self.gate.pause(cancel_round=True)
         self.toggle_button.configure(text="开启托管 (F8)")
         self._set_status("紧急停止", "当前一轮已取消；按 F8 可重新开启", "#b3261e")
 
     def run_now(self) -> None:
-        if self.config.calibration is None:
-            messagebox.showinfo("尚未校准", "请先完成位置校准。")
+        if self._auto_detecting:
+            self._set_status("正在自动识别", "识别完成后会立即执行；按 F9 可取消识别", "#b7791f")
             return
-        self.gate.enable()
+        if self.config.calibration is None:
+            messagebox.showinfo("尚未校准", "请先完成位置校准。", parent=self.root)
+            return
+        # 取消可能卡在“等待游戏”的旧轮次，让这次点击确实启动一轮新的查找。
+        self.gate.restart()
         self.run_now_event.set()
         self.schedule.run_now(time.monotonic())
         self.toggle_button.configure(text="暂停托管 (F8)")
@@ -539,24 +615,95 @@ class TaskbarHeroApp:
             return
         self.gate.pause(cancel_round=True)
         self._auto_detecting = True
+        cancel_event = threading.Event()
+        self._auto_detection_cancel = cancel_event
+        self._set_auto_detection_controls(True)
         self._set_status("正在自动识别", "正在查找游戏并准备背包与魔方窗口", "#b7791f")
-        self.root.withdraw()
-        self.root.after(500, self._perform_auto_detection)
+        # 不再隐藏整个界面；临时取消置顶，让游戏可以接管前台，同时保留进度与退出按钮。
+        self.root.attributes("-topmost", False)
+        self.root.after(250, self._start_auto_detection_worker, cancel_event)
 
-    def _perform_auto_detection(self) -> None:
+    def _set_auto_detection_controls(self, busy: bool) -> None:
+        state = ["disabled"] if busy else ["!disabled"]
+        for button in (
+            self.toggle_button,
+            self.run_now_button,
+            self.auto_detection_button,
+            self.manual_calibration_button,
+        ):
+            button.state(state)
+
+    def _start_auto_detection_worker(self, cancel_event: threading.Event) -> None:
+        if (
+            self._exiting
+            or not self._auto_detecting
+            or cancel_event is not self._auto_detection_cancel
+        ):
+            return
         previous_calibration = self.config.calibration
+        self._auto_detection_thread = threading.Thread(
+            target=self._perform_auto_detection,
+            args=(cancel_event, previous_calibration),
+            name="auto-detection",
+            daemon=True,
+        )
+        self._auto_detection_thread.start()
+
+    def _perform_auto_detection(
+        self,
+        cancel_event: threading.Event,
+        previous_calibration: Calibration | None,
+    ) -> None:
         image: bytes | None = None
         width = 0
         height = 0
+
+        def checkpoint() -> None:
+            if cancel_event.is_set() or self.gate.shutdown_requested:
+                raise RoundCancelled()
+
+        def wait(seconds: float) -> None:
+            deadline = time.monotonic() + seconds
+            while True:
+                checkpoint()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                cancel_event.wait(min(0.10, remaining))
+
+        lock_acquired = False
         try:
+            self.ui_queue.put(
+                (
+                    "auto_detection_status",
+                    (cancel_event, "正在等待当前自动化操作安全停止"),
+                )
+            )
+            while not self._automation_lock.acquire(timeout=0.10):
+                checkpoint()
+            lock_acquired = True
+            checkpoint()
+            self.ui_queue.put(
+                (
+                    "auto_detection_status",
+                    (cancel_event, "正在查找 TaskBarHero 游戏窗口"),
+                )
+            )
             preferred_identity = (
                 previous_calibration.window if previous_calibration is not None else None
             )
             hwnd = find_taskbar_hero_window(preferred_identity)
             if not hwnd:
                 raise ValueError("未找到正在运行的 TaskBarHero.exe，请先启动游戏")
+            checkpoint()
             identity = describe_window(hwnd)
             window_dpi = get_window_dpi(hwnd)
+            self.ui_queue.put(
+                (
+                    "auto_detection_status",
+                    (cancel_event, "已找到游戏，正在准备背包与魔方窗口"),
+                )
+            )
             LOG.info(
                 "自动识别目标：window=%r process=%r class=%r client=%dx%d "
                 "dpi=%d scale=%.2f diagnostics=%s",
@@ -571,8 +718,11 @@ class TaskbarHeroApp:
             )
             image, width, height, result = open_synthesis_interface(
                 hwnd,
+                wait=wait,
+                checkpoint=checkpoint,
                 diagnostics_dir=self.diagnostics_dir,
             )
+            checkpoint()
             LOG.info(
                 "自动识别截图：window=%r process=%r client=%dx%d dpi=%d scale=%.2f",
                 identity.title,
@@ -587,14 +737,20 @@ class TaskbarHeroApp:
                 points=layout_points_from_anchor(result.anchor, result.scale),
             )
             calibration.validate()
-            self.config.calibration = calibration
-            self.config.save()
+            checkpoint()
             LOG.info(
                 "自动识别成功：anchor=(%d,%d), scale=%.2f, confidence=%.1f%%",
                 result.anchor.x,
                 result.anchor.y,
                 result.scale,
                 result.confidence * 100,
+            )
+        except RoundCancelled:
+            LOG.info("自动识别已取消")
+            outcome = AutoDetectionOutcome(
+                cancel_event=cancel_event,
+                previous_calibration=previous_calibration,
+                cancelled=True,
             )
         except Exception as error:
             LOG.exception("自动识别位置失败")
@@ -611,33 +767,90 @@ class TaskbarHeroApp:
                     LOG.error("自动识别失败截图已保存：%s", failure_path)
                 except Exception:
                     LOG.exception("保存自动识别失败截图时出错")
-            self.config.calibration = previous_calibration
-            self._auto_detecting = False
-            self.root.deiconify()
-            if previous_calibration is not None:
-                self.gate.enable()
-                self._set_status("自动识别失败", "已保留原校准配置", "#b3261e")
-            else:
-                self._set_status("需要校准", "自动识别失败，请使用手动校准", "#b3261e")
-            messagebox.showerror(
-                "自动识别失败",
-                f"{error}\n\n已停止操作，可点击“手动校准”继续。"
-                + (f"\n失败截图：{failure_path}" if failure_path else "")
-                + (f"\n诊断目录：{self.diagnostics_dir}" if self.diagnostics_dir else ""),
-                parent=self.root,
+            outcome = AutoDetectionOutcome(
+                cancel_event=cancel_event,
+                previous_calibration=previous_calibration,
+                error=str(error),
+                failure_path=failure_path,
             )
+        else:
+            outcome = AutoDetectionOutcome(
+                cancel_event=cancel_event,
+                previous_calibration=previous_calibration,
+                calibration=calibration,
+            )
+        finally:
+            if lock_acquired:
+                self._automation_lock.release()
+        self.ui_queue.put(("auto_detection_finished", outcome))
+
+    def _finish_auto_detection(self, payload: object) -> None:
+        if not isinstance(payload, AutoDetectionOutcome):
+            return
+        if payload.cancel_event is not self._auto_detection_cancel or self._exiting:
             return
 
         self._auto_detecting = False
-        self.root.deiconify()
-        self.schedule.run_now(time.monotonic())
-        self.gate.enable()
-        self.run_now_event.set()
-        self.toggle_button.configure(text="暂停托管 (F8)")
-        self._set_status("识别完成", "游戏与全部按钮位置已识别，将立即执行第一轮", "#137333")
-        messagebox.showinfo("自动识别完成", "全部按钮位置已保存，将立即执行第一轮。", parent=self.root)
+        self._auto_detection_thread = None
+        self._auto_detection_cancel = None
+        self._set_auto_detection_controls(False)
+        self.root.attributes("-topmost", True)
+        self.show_main_window()
+
+        if payload.cancelled or payload.cancel_event.is_set():
+            self.config.calibration = payload.previous_calibration
+            self.toggle_button.configure(text="开启托管 (F8)")
+            self._set_status("已取消识别", "没有执行后续鼠标操作", "#666666")
+            return
+
+        if payload.calibration is not None:
+            self.config.calibration = payload.calibration
+            try:
+                self.config.save()
+            except Exception as error:
+                LOG.exception("自动识别配置保存失败")
+                self.config.calibration = payload.previous_calibration
+                payload = AutoDetectionOutcome(
+                    cancel_event=payload.cancel_event,
+                    previous_calibration=payload.previous_calibration,
+                    error=f"无法保存识别结果：{error}",
+                )
+            else:
+                self.toggle_button.configure(text="暂停托管 (F8)")
+                self._set_status(
+                    "识别完成",
+                    "游戏与全部按钮位置已识别，将立即执行第一轮",
+                    "#137333",
+                )
+                messagebox.showinfo(
+                    "自动识别完成",
+                    "全部按钮位置已保存，将立即执行第一轮。",
+                    parent=self.root,
+                )
+                if self._exiting:
+                    return
+                self.schedule.run_now(time.monotonic())
+                self.gate.enable()
+                self.run_now_event.set()
+                return
+
+        self.config.calibration = payload.previous_calibration
+        self.toggle_button.configure(text="开启托管 (F8)")
+        if payload.previous_calibration is not None:
+            self._set_status("自动识别失败", "已保留原校准配置，托管保持暂停", "#b3261e")
+        else:
+            self._set_status("需要校准", "自动识别失败，请使用手动校准", "#b3261e")
+        messagebox.showerror(
+            "自动识别失败",
+            f"{payload.error}\n\n已停止操作，可点击“手动校准”继续。"
+            + (f"\n失败截图：{payload.failure_path}" if payload.failure_path else "")
+            + (f"\n诊断目录：{self.diagnostics_dir}" if self.diagnostics_dir else ""),
+            parent=self.root,
+        )
 
     def start_calibration(self) -> None:
+        if self._auto_detecting:
+            return
         if self._wizard is not None and self._wizard.winfo_exists():
             self._wizard.lift()
             return
@@ -797,10 +1010,13 @@ class TaskbarHeroApp:
             self._wizard.lift()
 
     def exit_application(self) -> None:
-        """Fully stop the app when the tray's exit command is selected."""
+        """Fully stop the app from either the main window or system tray."""
         if self._exiting:
             return
         self._exiting = True
+        cancel_event = getattr(self, "_auto_detection_cancel", None)
+        if cancel_event is not None:
+            cancel_event.set()
         self.gate.request_shutdown()
         self.hotkeys.stop()
         self.session_logging.disable()

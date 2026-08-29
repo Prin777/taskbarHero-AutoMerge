@@ -7,8 +7,13 @@ from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
 
 from tbh_automation.autodetect import AutoDetectionResult, CubeIconDetectionResult
+from tbh_automation.engine import RoundCancelled
 from tbh_automation.model import Calibration, Point, WindowIdentity
-from tbh_automation.windows import Win32AutomationDriver, open_synthesis_interface
+from tbh_automation.windows import (
+    GameActivationError,
+    Win32AutomationDriver,
+    open_synthesis_interface,
+)
 
 
 class InterfaceBootstrapTests(unittest.TestCase):
@@ -38,6 +43,37 @@ class InterfaceBootstrapTests(unittest.TestCase):
         self.assertEqual(driver.calibration.points["auto_fill"], Point(144, 210))
         self.assertEqual(driver.calibration.points["combine"], Point(328, 210))
         self.assertEqual(set(driver.calibration.points), Calibration.REQUIRED_POINTS)
+
+    def test_driver_keeps_waiting_when_verified_game_is_not_yet_activatable(self) -> None:
+        driver = object.__new__(Win32AutomationDriver)
+        driver.calibration = Calibration(
+            window=WindowIdentity(
+                process_name="TaskBarHero.exe",
+                class_name="UnityWndClass",
+                client_width=800,
+                client_height=700,
+            ),
+            points={key: Point(0, 0) for key in Calibration.REQUIRED_POINTS},
+        )
+        driver.generation = 4
+        driver.gate = Mock()
+        driver.checkpoint = Mock()
+        driver._foreground = Mock(return_value=123)
+        driver.status = Mock()
+        result = AutoDetectionResult(Point(100, 200), 0.1, 1.5)
+
+        with patch(
+            "tbh_automation.windows.open_synthesis_interface",
+            side_effect=[
+                GameActivationError("not ready"),
+                (b"frame", 800, 700, result),
+            ],
+        ) as open_interface:
+            driver.prepare_interface()
+
+        self.assertEqual(open_interface.call_count, 2)
+        driver.status.assert_called_once_with("已找到 TaskBarHero，正在等待游戏窗口可以激活")
+        driver.gate.interruptible_wait.assert_called_once_with(0.5, 4)
 
     def test_already_open_synthesis_does_not_press_or_click(self) -> None:
         result = AutoDetectionResult(Point(100, 200), 0.1, 1.5)
@@ -81,8 +117,8 @@ class InterfaceBootstrapTests(unittest.TestCase):
         ):
             open_synthesis_interface(123, wait=waits.append)
 
-        press_tab.assert_called_once_with(123)
-        click.assert_called_once_with(123, cube.center, "黄色魔方入口")
+        press_tab.assert_called_once_with(123, wait=waits.append)
+        click.assert_called_once_with(123, cube.center, "黄色魔方入口", wait=waits.append)
         self.assertEqual(waits, [1.0, 1.2])
 
     def test_failed_cube_detection_saves_every_capture_stage(self) -> None:
@@ -141,7 +177,41 @@ class InterfaceBootstrapTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "unrecognized"):
                 open_synthesis_interface(123, wait=lambda _seconds: None)
 
-        click.assert_called_once_with(123, cube.center, "黄色魔方入口")
+        click.assert_called_once()
+        self.assertEqual(click.call_args.args, (123, cube.center, "黄色魔方入口"))
+
+    def test_cancellation_after_detection_prevents_the_cube_click(self) -> None:
+        cube = CubeIconDetectionResult(Point(300, 500), (270, 470, 330, 530), 500)
+        cancelled = False
+
+        def cancel_during_text_detection(*_args, **_kwargs):
+            nonlocal cancelled
+            cancelled = True
+            raise ValueError("panel not open")
+
+        def checkpoint() -> None:
+            if cancelled:
+                raise RoundCancelled()
+
+        with (
+            patch("tbh_automation.windows.temporarily_uncover_window", return_value=nullcontext()),
+            patch("tbh_automation.windows.capture_client_bgra", return_value=(b"frame", 800, 700)),
+            patch("tbh_automation.windows.get_window_dpi", return_value=144),
+            patch("tbh_automation.windows.find_cube_icon", return_value=cube),
+            patch(
+                "tbh_automation.windows.find_auto_fill_anchor",
+                side_effect=cancel_during_text_detection,
+            ),
+            patch("tbh_automation.windows.click_game_point") as click,
+        ):
+            with self.assertRaises(RoundCancelled):
+                open_synthesis_interface(
+                    123,
+                    wait=lambda _seconds: None,
+                    checkpoint=checkpoint,
+                )
+
+        click.assert_not_called()
 
 
 if __name__ == "__main__":

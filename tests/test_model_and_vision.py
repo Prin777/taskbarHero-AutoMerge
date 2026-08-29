@@ -8,12 +8,15 @@ from unittest.mock import patch
 
 from tbh_automation.model import AppConfig, Calibration, Point, WindowIdentity
 from tbh_automation.windows import (
+    HWND_NOTOPMOST,
+    GameActivationError,
     Win32AutomationDriver,
     blue_highlight_ratio,
     crop_bgra,
     image_has_visual_content,
     is_taskbar_hero_identity,
     point_is_safe_on_active_game,
+    temporarily_uncover_window,
 )
 
 
@@ -22,6 +25,41 @@ def pixel(blue: int, green: int, red: int) -> bytes:
 
 
 class VisionTests(unittest.TestCase):
+    def test_game_activation_retries_before_using_the_window(self) -> None:
+        waits: list[float] = []
+        with (
+            patch("tbh_automation.windows.user32.GetWindowLongW", return_value=0),
+            patch("tbh_automation.windows.user32.IsIconic", return_value=False),
+            patch("tbh_automation.windows.user32.SetWindowPos", return_value=True),
+            patch("tbh_automation.windows.user32.BringWindowToTop", return_value=True),
+            patch("tbh_automation.windows.user32.SetForegroundWindow", return_value=True) as activate,
+            patch("tbh_automation.windows.get_foreground_root", side_effect=[999, 123]),
+            patch("tbh_automation.windows._root_window", side_effect=lambda hwnd: hwnd),
+            patch("tbh_automation.windows._topmost_obstructions_above", return_value=[]),
+        ):
+            with temporarily_uncover_window(123, wait=waits.append):
+                pass
+
+        self.assertEqual(activate.call_count, 2)
+        self.assertEqual(waits, [0.15, 0.20])
+
+    def test_failed_activation_restores_the_original_non_topmost_state(self) -> None:
+        with (
+            patch("tbh_automation.windows.user32.GetWindowLongW", return_value=0),
+            patch("tbh_automation.windows.user32.IsIconic", return_value=False),
+            patch("tbh_automation.windows.user32.SetWindowPos", return_value=True) as set_position,
+            patch("tbh_automation.windows.user32.BringWindowToTop", return_value=True),
+            patch("tbh_automation.windows.user32.SetForegroundWindow", return_value=False),
+            patch("tbh_automation.windows.get_foreground_root", return_value=999),
+            patch("tbh_automation.windows._root_window", side_effect=lambda hwnd: hwnd),
+            patch("tbh_automation.windows.time.monotonic", side_effect=[0.0, 4.0]),
+        ):
+            with self.assertRaises(GameActivationError):
+                with temporarily_uncover_window(123, wait=lambda _seconds: None):
+                    pass
+
+        self.assertIs(set_position.call_args_list[-1].args[1], HWND_NOTOPMOST)
+
     def test_transparent_game_can_report_the_normal_window_underneath(self) -> None:
         with (
             patch("tbh_automation.windows.point_is_visible_on_window", return_value=False),
