@@ -14,6 +14,10 @@ from typing import Callable, Iterator
 
 from .autodetect import (
     AutoDetectionResult,
+    AmbiguousDetectionError,
+    COMBINE_BUTTON_BASE_SAMPLE_SIZE,
+    SynthesisLayoutError,
+    combine_button_sample_size,
     find_auto_fill_anchor,
     find_cube_icon,
     layout_points_from_anchor,
@@ -62,7 +66,7 @@ TASKBAR_HERO_TITLE = "TaskBarHero"
 
 CURSOR_SETTLE_SECONDS = 0.10
 MAX_DIAGNOSTIC_SCREENSHOTS = 200
-COMBINE_BUTTON_SAMPLE_SIZE = 32
+COMBINE_BUTTON_SAMPLE_SIZE = COMBINE_BUTTON_BASE_SAMPLE_SIZE
 COMBINE_BUTTON_BLUE_RATIO_THRESHOLD = 0.25
 COMBINE_BUTTON_CONFIRMATIONS = 2
 COMBINE_BUTTON_CONFIRM_INTERVAL_SECONDS = 0.20
@@ -693,6 +697,8 @@ def open_synthesis_interface(
             height,
             preferred_scale=dpi / 96,
             require_button_color=True,
+            require_synthesis_layout=True,
+            checkpoint=ensure_active,
         )
         ensure_active()
         return result
@@ -700,22 +706,35 @@ def open_synthesis_interface(
     image, width, height = capture("initial")
     ensure_active()
     try:
-        cube = find_cube_icon(image, width, height)
+        cube = find_cube_icon(image, width, height, checkpoint=ensure_active)
         ensure_active()
         LOG.info("英雄背包已打开：识别到魔方入口 %s", cube)
+    except AmbiguousDetectionError:
+        raise
     except ValueError:
+        # 客户区较大时入口可能不在预期搜索带内，但已打开的完整合成面板
+        # 仍可独立验证。验证成功后不发送 Tab，以免把面板关闭。
+        try:
+            return image, width, height, detect(image, width, height)
+        except (SynthesisLayoutError, AmbiguousDetectionError):
+            raise
+        except ValueError:
+            pass
         LOG.info("当前未显示英雄背包，开始自动准备界面")
         ensure_active()
         press_tab_on_game(hwnd, wait=pause)
         pause(1.0)
         image, width, height = capture("after-tab")
         ensure_active()
-        cube = find_cube_icon(image, width, height)
+        cube = find_cube_icon(image, width, height, checkpoint=ensure_active)
         ensure_active()
         LOG.info("按 Tab 后识别到魔方入口：%s", cube)
     else:
         try:
             return image, width, height, detect(image, width, height)
+        except (SynthesisLayoutError, AmbiguousDetectionError):
+            # 已看到面板但模式错误或控件越界时，不能点击入口把面板关闭。
+            raise
         except ValueError:
             LOG.info("英雄背包已打开，但当前未显示魔方合成窗口")
 
@@ -855,6 +874,7 @@ class Win32AutomationDriver:
         combination_wait: float,
         status: Callable[[str], None] | None = None,
         diagnostics_dir: Path | None = None,
+        on_scale_detected: Callable[[float], None] | None = None,
     ) -> None:
         calibration.validate()
         self.calibration = calibration
@@ -864,6 +884,8 @@ class Win32AutomationDriver:
         self.combination_wait = combination_wait
         self.status = status or (lambda _message: None)
         self.diagnostics_dir = diagnostics_dir
+        self._interface_scale = 1.0
+        self.on_scale_detected = on_scale_detected
         self._diagnostic_index = (
             sum(1 for _path in diagnostics_dir.glob("*.bmp"))
             if diagnostics_dir is not None
@@ -910,15 +932,25 @@ class Win32AutomationDriver:
             self.calibration.window.client_height,
         ):
             raise AutomationError("游戏窗口尺寸在界面准备期间发生变化，请重新自动识别")
-        self.calibration.points.update(
-            layout_points_from_anchor(result.anchor, result.scale)
-        )
+        try:
+            points = layout_points_from_anchor(
+                result.anchor, result.scale, client_size=(width, height)
+            )
+        except ValueError as error:
+            raise AutomationError(str(error)) from error
+        self.calibration.points.update(points)
+        self._interface_scale = result.scale
+        if callback := getattr(self, "on_scale_detected", None):
+            callback(result.scale)
         LOG.info(
             "合成界面准备完成：anchor=(%d,%d) scale=%.2f，全部按钮位置已刷新",
             result.anchor.x,
             result.anchor.y,
             result.scale,
         )
+
+    def _button_sample_size(self) -> int:
+        return combine_button_sample_size(getattr(self, "_interface_scale", 1.0))
 
     def _click(self, key: str) -> None:
         self.checkpoint()
@@ -952,7 +984,7 @@ class Win32AutomationDriver:
                 button_image = capture_client_patch(
                     hwnd,
                     self.calibration.points["combine"],
-                    COMBINE_BUTTON_SAMPLE_SIZE,
+                    self._button_sample_size(),
                 )
                 button_ratio = blue_highlight_ratio(button_image)
                 if button_ratio < COMBINE_BUTTON_BLUE_RATIO_THRESHOLD:
@@ -993,7 +1025,7 @@ class Win32AutomationDriver:
             screen = client_to_screen(hwnd, center)
             if not point_is_safe_on_active_game(hwnd, screen):
                 raise AutomationError("合成按钮被其他窗口遮挡，已禁止点击")
-            image = capture_client_patch(hwnd, center, COMBINE_BUTTON_SAMPLE_SIZE)
+            image = capture_client_patch(hwnd, center, self._button_sample_size())
         return blue_highlight_ratio(image), image
 
     def _save_button_diagnostic(self, image: bytes, ratio: float, enabled: bool) -> None:
@@ -1010,8 +1042,8 @@ class Win32AutomationDriver:
             path = save_bgra_bmp(
                 self.diagnostics_dir / filename,
                 image,
-                COMBINE_BUTTON_SAMPLE_SIZE,
-                COMBINE_BUTTON_SAMPLE_SIZE,
+                self._button_sample_size(),
+                self._button_sample_size(),
             )
             LOG.info("合成按钮诊断截图：%s", path)
         except Exception:

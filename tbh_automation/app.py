@@ -167,6 +167,7 @@ class AutoDetectionOutcome:
     error: str = ""
     failure_path: Path | None = None
     cancelled: bool = False
+    detected_scale: float | None = None
 
 
 CALIBRATION_STEPS = [
@@ -238,6 +239,7 @@ class TaskbarHeroApp:
 
         self.status_var = tk.StringVar(value="正在启动")
         self.detail_var = tk.StringVar(value="")
+        self.scale_var = tk.StringVar(value="当前识别模板缩放：未识别")
         self.stats_var = tk.StringVar(value="已完成 0 轮，共合成 0 次")
         self.interval_var = tk.StringVar(
             value=interval_option_for_seconds(self.config.interval_seconds)
@@ -301,6 +303,14 @@ class TaskbarHeroApp:
             pady=self._px(9),
         )
         self.status_label.pack(fill="x")
+        self.scale_label = ttk.Label(
+            outer,
+            textvariable=self.scale_var,
+            anchor="center",
+            foreground="#555555",
+            font=("Microsoft YaHei UI", 10),
+        )
+        self.scale_label.pack(fill="x", pady=(self._px(5), 0))
         self.stats_label = ttk.Label(
             outer,
             textvariable=self.stats_var,
@@ -309,7 +319,7 @@ class TaskbarHeroApp:
         )
         self.stats_label.pack(
             fill="x",
-            pady=(self._px(10), self._px(8)),
+            pady=(self._px(3), self._px(8)),
         )
 
         interval_row = ttk.Frame(outer)
@@ -441,6 +451,10 @@ class TaskbarHeroApp:
     def _post_status(self, detail: str) -> None:
         self.ui_queue.put(("status", detail))
 
+    def _set_detected_scale(self, scale: float | None) -> None:
+        value = "未识别" if scale is None else f"×{scale:g}"
+        self.scale_var.set(f"当前识别模板缩放：{value}")
+
     def _poll_ui_queue(self) -> None:
         try:
             while True:
@@ -459,6 +473,12 @@ class TaskbarHeroApp:
                 elif kind == "error":
                     self._set_status("已安全暂停", str(payload), "#b3261e")
                     self.toggle_button.configure(text="开启托管 (F8)")
+                elif kind == "detected_scale":
+                    calibration, scale = payload
+                    # 允许暂停后显示本轮已确认的比例；已被新校准替换的旧轮次
+                    # 结果则丢弃。后台只投递数据，不直接修改 Tk 控件。
+                    if calibration is self.config.calibration:
+                        self._set_detected_scale(scale)
                 elif kind == "tray_show":
                     self.show_main_window()
                 elif kind == "tray_exit":
@@ -526,6 +546,9 @@ class TaskbarHeroApp:
                 combination_wait=self.config.combination_wait_seconds,
                 status=self._post_status,
                 diagnostics_dir=self.diagnostics_dir,
+                on_scale_detected=lambda scale, calibration=calibration: self.ui_queue.put(
+                    ("detected_scale", (calibration, scale))
+                ),
             )
             engine = SynthesisEngine(
                 driver,
@@ -734,7 +757,9 @@ class TaskbarHeroApp:
             )
             calibration = Calibration(
                 window=identity,
-                points=layout_points_from_anchor(result.anchor, result.scale),
+                points=layout_points_from_anchor(
+                    result.anchor, result.scale, client_size=(width, height)
+                ),
             )
             calibration.validate()
             checkpoint()
@@ -778,6 +803,7 @@ class TaskbarHeroApp:
                 cancel_event=cancel_event,
                 previous_calibration=previous_calibration,
                 calibration=calibration,
+                detected_scale=result.scale,
             )
         finally:
             if lock_acquired:
@@ -816,6 +842,7 @@ class TaskbarHeroApp:
                     error=f"无法保存识别结果：{error}",
                 )
             else:
+                self._set_detected_scale(payload.detected_scale)
                 self.toggle_button.configure(text="暂停托管 (F8)")
                 self._set_status(
                     "识别完成",
@@ -975,6 +1002,7 @@ class TaskbarHeroApp:
         self.root.deiconify()
         self._wizard.destroy()
         self._wizard = None
+        self._set_detected_scale(None)
         self.schedule.run_now(time.monotonic())
         self.gate.enable()
         self.run_now_event.set()

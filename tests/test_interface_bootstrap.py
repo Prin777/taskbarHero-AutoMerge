@@ -6,7 +6,9 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
 
-from tbh_automation.autodetect import AutoDetectionResult, CubeIconDetectionResult
+from tbh_automation.autodetect import (
+    AmbiguousDetectionError, AutoDetectionResult, CubeIconDetectionResult, SynthesisLayoutError,
+)
 from tbh_automation.engine import RoundCancelled
 from tbh_automation.model import Calibration, Point, WindowIdentity
 from tbh_automation.windows import (
@@ -106,7 +108,7 @@ class InterfaceBootstrapTests(unittest.TestCase):
             patch("tbh_automation.windows.get_window_dpi", return_value=144),
             patch(
                 "tbh_automation.windows.find_auto_fill_anchor",
-                return_value=result,
+                side_effect=[ValueError("hero menu closed"), result],
             ),
             patch(
                 "tbh_automation.windows.find_cube_icon",
@@ -120,6 +122,43 @@ class InterfaceBootstrapTests(unittest.TestCase):
         press_tab.assert_called_once_with(123, wait=waits.append)
         click.assert_called_once_with(123, cube.center, "黄色魔方入口", wait=waits.append)
         self.assertEqual(waits, [1.0, 1.2])
+
+    def test_open_panel_outside_the_cube_search_band_does_not_press_tab(self) -> None:
+        result = AutoDetectionResult(Point(100, 200), 0.01, 1.0)
+        with (
+            patch("tbh_automation.windows.temporarily_uncover_window", return_value=nullcontext()),
+            patch("tbh_automation.windows.capture_client_bgra", return_value=(b"frame", 800, 700)),
+            patch("tbh_automation.windows.get_window_dpi", return_value=96),
+            patch("tbh_automation.windows.find_cube_icon", side_effect=ValueError("outside band")),
+            patch("tbh_automation.windows.find_auto_fill_anchor", return_value=result),
+            patch("tbh_automation.windows.press_tab_on_game") as press,
+            patch("tbh_automation.windows.click_game_point") as click,
+        ):
+            self.assertEqual(open_synthesis_interface(123)[3], result)
+        press.assert_not_called()
+        click.assert_not_called()
+
+    def test_wrong_mode_and_ambiguous_candidates_do_not_trigger_navigation(self) -> None:
+        cube = CubeIconDetectionResult(Point(300, 500), (270, 470, 330, 530), 500)
+        for cube_error, text_error in (
+            (None, SynthesisLayoutError("wrong mode")),
+            (None, AmbiguousDetectionError("two panels")),
+            (AmbiguousDetectionError("two cubes"), None),
+        ):
+            with (
+                self.subTest(cube_error=cube_error, text_error=text_error),
+                patch("tbh_automation.windows.temporarily_uncover_window", return_value=nullcontext()),
+                patch("tbh_automation.windows.capture_client_bgra", return_value=(b"frame", 800, 700)),
+                patch("tbh_automation.windows.get_window_dpi", return_value=96),
+                patch("tbh_automation.windows.find_cube_icon", return_value=cube, side_effect=cube_error),
+                patch("tbh_automation.windows.find_auto_fill_anchor", side_effect=text_error),
+                patch("tbh_automation.windows.press_tab_on_game") as press,
+                patch("tbh_automation.windows.click_game_point") as click,
+            ):
+                with self.assertRaises(ValueError):
+                    open_synthesis_interface(123)
+            press.assert_not_called()
+            click.assert_not_called()
 
     def test_failed_cube_detection_saves_every_capture_stage(self) -> None:
         with TemporaryDirectory() as temporary_directory:

@@ -1,3 +1,3 @@
 """Task Bar Hero 自动合成工具。"""
 
-__version__ = "0.7.3"
+__version__ = "0.8.1"
