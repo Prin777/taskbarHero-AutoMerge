@@ -138,12 +138,30 @@ class InterfaceBootstrapTests(unittest.TestCase):
         press.assert_not_called()
         click.assert_not_called()
 
+    def test_verified_open_panel_does_not_search_ambiguous_desktop_icons(self) -> None:
+        result = AutoDetectionResult(Point(100, 200), 0.01, 2.0)
+        with (
+            patch("tbh_automation.windows.temporarily_uncover_window", return_value=nullcontext()),
+            patch("tbh_automation.windows.capture_client_bgra", return_value=(b"frame", 800, 700)),
+            patch("tbh_automation.windows.get_window_dpi", return_value=96),
+            patch("tbh_automation.windows.find_cube_icon", side_effect=AmbiguousDetectionError("wallpaper")) as cube,
+            patch("tbh_automation.windows.find_auto_fill_anchor", return_value=result) as detect,
+            patch("tbh_automation.windows.press_tab_on_game") as press,
+            patch("tbh_automation.windows.click_game_point") as click,
+        ):
+            self.assertEqual(open_synthesis_interface(123)[3], result)
+        cube.assert_not_called()
+        press.assert_not_called()
+        click.assert_not_called()
+        self.assertTrue(detect.call_args.kwargs["require_synthesis_layout"])
+        self.assertTrue(detect.call_args.kwargs["require_button_color"])
+
     def test_wrong_mode_and_ambiguous_candidates_do_not_trigger_navigation(self) -> None:
         cube = CubeIconDetectionResult(Point(300, 500), (270, 470, 330, 530), 500)
         for cube_error, text_error in (
             (None, SynthesisLayoutError("wrong mode")),
             (None, AmbiguousDetectionError("two panels")),
-            (AmbiguousDetectionError("two cubes"), None),
+            (AmbiguousDetectionError("two cubes"), ValueError("panel closed")),
         ):
             with (
                 self.subTest(cube_error=cube_error, text_error=text_error),

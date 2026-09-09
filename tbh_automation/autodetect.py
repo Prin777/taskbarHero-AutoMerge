@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
-from typing import Callable, Iterator
+from typing import Callable
 
 from .model import Point
 
@@ -106,12 +106,12 @@ def _scaled_samples(scale: float) -> tuple[int, int, list[tuple[int, int, bool]]
     return scaled_width, scaled_height, samples
 
 
-def _brown_anchor_columns(
+def _brown_anchor_mask(
     rows: tuple[int, ...],
     y: int,
     offsets: tuple[tuple[int, int], ...],
     valid_columns: int,
-) -> Iterator[int]:
+) -> int:
     """用每像素一个字节的位集合，筛出七个采样点中至少两个为棕色的锚点。
 
     与逐像素预筛选等价，包括奇数坐标及中心被文字覆盖的情况。大幅减少
@@ -123,11 +123,7 @@ def _brown_anchor_columns(
             shifted = rows[y + dy] >> (dx * 8)
             twice |= seen & shifted
             seen |= shifted
-    twice &= valid_columns
-    while twice:
-        lowest = twice & -twice
-        yield (lowest.bit_length() - 1) // 8
-        twice ^= lowest
+    return twice & valid_columns
 
 
 def _best_match_at_scale(
@@ -138,6 +134,7 @@ def _best_match_at_scale(
     brown_mask: bytes | None = None,
     checkpoint: Callable[[], None] | None = None,
     matches: list[tuple[Point, float, float]] | None = None,
+    bright_rows: tuple[int, ...] | None = None,
 ) -> tuple[Point | None, float]:
     mask_width, mask_height, samples = _scaled_samples(scale)
     if width < mask_width or height < mask_height:
@@ -163,28 +160,42 @@ def _best_match_at_scale(
         (round(29 * scale) + round(dx * scale), round(7 * scale) + round(dy * scale))
         for dx, dy in ((0, 0), (-12, -5), (12, -5), (-12, 5), (12, 5), (-22, 0), (22, 0))
     )
-    valid_columns = (1 << (8 * (max_x + 1))) - 1 if brown_rows is not None else 0
+    # 每像素仍占一个字节，位 0 表示明暗；所有横坐标（含奇数）并行比较。
+    if bright_rows is None:
+        binary = gray.translate(bytes(int(value >= GRAY_THRESHOLD) for value in range(256)))
+        bright_rows = tuple(
+            int.from_bytes(binary[y * width:(y + 1) * width], "little")
+            for y in range(height)
+        )
+    valid_columns = int.from_bytes(b"\x01" * (max_x + 1), "little")
+    sample_rows = []
+    for row_y in range(mask_height):
+        row_samples = [sample for sample in samples if sample[1] == row_y]
+        row_mask = sum(1 << (x * 8) for x, _, _ in row_samples)
+        expected = sum(1 << (x * 8) for x, _, on in row_samples if on)
+        sample_rows.append((row_y, row_mask, expected))
     for y in range(max_y + 1):
         if checkpoint is not None and y % 16 == 0:
             checkpoint()
-        columns = (
-            _brown_anchor_columns(brown_rows, y, brown_offsets, valid_columns)
-            if brown_rows is not None else range(max_x + 1)
-        )
-        for x in columns:
-            mismatches = 0
-            for sample_x, sample_y, expected_on in prefilter:
-                actual_on = gray[(y + sample_y) * width + x + sample_x] >= GRAY_THRESHOLD
-                mismatches += actual_on != expected_on
-                if mismatches > MAX_PREFILTER_MISMATCHES:
-                    break
-            if mismatches > MAX_PREFILTER_MISMATCHES:
-                continue
-
-            mismatches = 0
-            for sample_x, sample_y, expected_on in samples:
-                actual_on = gray[(y + sample_y) * width + x + sample_x] >= GRAY_THRESHOLD
-                mismatches += actual_on != expected_on
+        # states[k] 表示目前预筛选错配不超过 k 的所有横坐标，与原逐点判断等价。
+        states = [valid_columns] * (MAX_PREFILTER_MISMATCHES + 1)
+        for sample_x, sample_y, expected_on in prefilter:
+            actual = bright_rows[y + sample_y] >> (sample_x * 8)
+            bad = (~actual if expected_on else actual) & valid_columns
+            for k in range(MAX_PREFILTER_MISMATCHES, 0, -1):
+                states[k] = (states[k] & ~bad) | (states[k - 1] & bad)
+            states[0] &= ~bad
+        candidates = states[-1]
+        if brown_rows is not None:
+            candidates &= _brown_anchor_mask(brown_rows, y, brown_offsets, valid_columns)
+        while candidates:
+            lowest = candidates & -candidates
+            x = (lowest.bit_length() - 1) // 8
+            candidates ^= lowest
+            mismatches = sum(
+                (((bright_rows[y + row_y] >> (x * 8)) ^ expected) & row_mask).bit_count()
+                for row_y, row_mask, expected in sample_rows
+            )
             ratio = mismatches / len(samples)
             if matches is not None and ratio <= MAX_MISMATCH_RATIO:
                 matches.append((Point(x, y), scale, ratio))
@@ -529,6 +540,7 @@ def find_auto_fill_anchor(
     *,
     require_synthesis_layout: bool = False,
     checkpoint: Callable[[], None] | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> AutoDetectionResult:
     """在前台窗口截图中以常见界面缩放比例寻找“自动填充”文字。"""
     if len(image_bgra) != width * height * 4:
@@ -538,7 +550,11 @@ def find_auto_fill_anchor(
 
     if checkpoint is not None:
         checkpoint()
+    if progress is not None:
+        progress("正在分析截图，准备识别模板比例")
     gray = _bgra_to_gray(image_bgra, checkpoint)
+    binary = gray.translate(bytes(int(value >= GRAY_THRESHOLD) for value in range(256)))
+    bright_rows = tuple(int.from_bytes(binary[y * width:(y + 1) * width], "little") for y in range(height))
     brown_mask: bytes | None = None
     if require_button_color:
         mask = bytearray(width * height)
@@ -560,7 +576,9 @@ def find_auto_fill_anchor(
     if preferred_scale is not None:
         # DPI 只决定搜索顺序。截图中的游戏比例才决定坐标和采样尺寸。
         scales = tuple(sorted(SUPPORTED_SCALES, key=lambda value: abs(value - preferred_scale)))
-    for scale in scales:
+    for index, scale in enumerate(scales, 1):
+        if progress is not None:
+            progress(f"正在核对模板 ×{scale:g}（{index}/{len(scales)}），F9 可取消")
         point, ratio = _best_match_at_scale(
             gray,
             width,
@@ -569,6 +587,7 @@ def find_auto_fill_anchor(
             brown_mask,
             checkpoint,
             matches,
+            bright_rows,
         )
         if point is not None and ratio < best_ratio:
             best_point = point

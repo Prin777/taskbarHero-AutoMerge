@@ -633,6 +633,7 @@ def open_synthesis_interface(
     wait: Callable[[float], None] | None = None,
     checkpoint: Callable[[], None] | None = None,
     diagnostics_dir: Path | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> tuple[bytes, int, int, AutoDetectionResult]:
     """必要时打开英雄背包和魔方，并返回自动填充文字的识别结果。"""
     pause = wait or time.sleep
@@ -699,27 +700,30 @@ def open_synthesis_interface(
             require_button_color=True,
             require_synthesis_layout=True,
             checkpoint=ensure_active,
+            progress=progress,
         )
         ensure_active()
         return result
 
     image, width, height = capture("initial")
+    # 已打开的合成面板通过完整文字、类别菜单、边界及多候选校验后，
+    # 不需要任何入口导航。透明客户区中的桌面黄色图案不应阻断此路径。
+    try:
+        return image, width, height, detect(image, width, height)
+    except (SynthesisLayoutError, AmbiguousDetectionError):
+        raise
+    except ValueError:
+        LOG.info("当前未确认合成面板，开始检查英雄背包入口")
+
     ensure_active()
     try:
         cube = find_cube_icon(image, width, height, checkpoint=ensure_active)
         ensure_active()
         LOG.info("英雄背包已打开：识别到魔方入口 %s", cube)
     except AmbiguousDetectionError:
+        # 需要导航时仍禁止从多个入口候选中猜选。
         raise
     except ValueError:
-        # 客户区较大时入口可能不在预期搜索带内，但已打开的完整合成面板
-        # 仍可独立验证。验证成功后不发送 Tab，以免把面板关闭。
-        try:
-            return image, width, height, detect(image, width, height)
-        except (SynthesisLayoutError, AmbiguousDetectionError):
-            raise
-        except ValueError:
-            pass
         LOG.info("当前未显示英雄背包，开始自动准备界面")
         ensure_active()
         press_tab_on_game(hwnd, wait=pause)
@@ -729,14 +733,6 @@ def open_synthesis_interface(
         cube = find_cube_icon(image, width, height, checkpoint=ensure_active)
         ensure_active()
         LOG.info("按 Tab 后识别到魔方入口：%s", cube)
-    else:
-        try:
-            return image, width, height, detect(image, width, height)
-        except (SynthesisLayoutError, AmbiguousDetectionError):
-            # 已看到面板但模式错误或控件越界时，不能点击入口把面板关闭。
-            raise
-        except ValueError:
-            LOG.info("英雄背包已打开，但当前未显示魔方合成窗口")
 
     ensure_active()
     click_game_point(hwnd, cube.center, "黄色魔方入口", wait=pause)
@@ -920,6 +916,7 @@ class Win32AutomationDriver:
                     ),
                     checkpoint=self.checkpoint,
                     diagnostics_dir=getattr(self, "diagnostics_dir", None),
+                    progress=getattr(self, "status", None),
                 )
                 break
             except GameActivationError:

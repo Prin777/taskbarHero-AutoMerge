@@ -744,6 +744,9 @@ class TaskbarHeroApp:
                 wait=wait,
                 checkpoint=checkpoint,
                 diagnostics_dir=self.diagnostics_dir,
+                progress=lambda detail: self.ui_queue.put(
+                    ("auto_detection_status", (cancel_event, detail))
+                ),
             )
             checkpoint()
             LOG.info(
