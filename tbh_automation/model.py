@@ -92,7 +92,8 @@ class AppConfig:
     click_delay_seconds: float = 0.35
     action_timeout_seconds: float = 12.0
     combination_wait_seconds: float = 2.5
-    version: int = 6
+    portal_enabled: bool = False
+    version: int = 7
 
     @classmethod
     def load(cls, path: Path | None = None) -> "AppConfig":
@@ -101,8 +102,11 @@ class AppConfig:
             return cls()
         raw = json.loads(config_path.read_text(encoding="utf-8"))
         calibration_raw = raw.pop("calibration", None)
+        migrate = "portal_enabled" not in raw or raw.get("version",6) != 7
         config = cls(**raw)
-        config.version = 6
+        if not isinstance(config.portal_enabled,bool):
+            raise ValueError("灵魂石识别配置必须为布尔值")
+        config.version = 7
         if calibration_raw is not None:
             try:
                 config.calibration = Calibration.from_dict(calibration_raw)
@@ -115,6 +119,8 @@ class AppConfig:
                 LOG.warning("已清除失效校准：%s", error)
                 config.calibration = None
                 config.save(config_path)
+        if migrate:
+            config.save(config_path)
         return config
 
     def save(self, path: Path | None = None) -> Path:

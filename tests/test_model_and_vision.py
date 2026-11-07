@@ -269,7 +269,7 @@ class ConfigTests(unittest.TestCase):
         self.assertIsNone(loaded.calibration)
         self.assertEqual(loaded.interval_seconds, 12345)
         self.assertIsNone(rewritten["calibration"])
-        self.assertEqual(rewritten["version"], 6)
+        self.assertEqual(rewritten["version"], 7)
 
 
 

@@ -198,7 +198,7 @@ class TaskbarHeroApp:
             LOG.warning("无法设置主窗口图标", exc_info=True)
         self.ui_scale = max(1.0, float(self.root.winfo_fpixels("1i")) / 96.0)
         width = self._px(410)
-        height = self._px(445)
+        height = self._px(475)
         right_margin = self._px(20)
         top_margin = self._px(20)
         screen_width = self.root.winfo_screenwidth()
@@ -217,9 +217,12 @@ class TaskbarHeroApp:
             LOG.exception("配置文件无法读取，将要求重新校准")
             self.config = AppConfig()
             self._config_load_error = str(error)
+        # Optional automation must be explicitly enabled for this session.
+        self.config.portal_enabled = False
         self.gate = ControlGate()
         self.ui_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.run_now_event = threading.Event()
+        self.portal_check_event = threading.Event()
         self.round_active_event = threading.Event()
         self._automation_lock = threading.Lock()
         self.schedule = RunSchedule.starting_now(self.config.interval_seconds, time.monotonic())
@@ -245,8 +248,10 @@ class TaskbarHeroApp:
             value=interval_option_for_seconds(self.config.interval_seconds)
         )
         self.hotkey_warning_var = tk.StringVar(value="")
+        self.portal_enabled_var = tk.BooleanVar(value=self.config.portal_enabled)
         self.save_logs_var = tk.BooleanVar(value=False)
         self._build_ui()
+        self._toggle_session_logging()
 
         self.tray = SystemTray(
             on_show=lambda: self.ui_queue.put(("tray_show", None)),
@@ -322,6 +327,8 @@ class TaskbarHeroApp:
             pady=(self._px(3), self._px(8)),
         )
 
+        ttk.Checkbutton(outer,text="识别灵魂石入口（空闲时勾选立即检查）",
+                        variable=self.portal_enabled_var,command=self._change_portal_option).pack(fill="x",pady=(0,self._px(6)))
         interval_row = ttk.Frame(outer)
         interval_row.pack(fill="x", pady=(0, self._px(8)))
         ttk.Label(interval_row, text="下一轮间隔：").pack(side="left")
@@ -411,6 +418,24 @@ class TaskbarHeroApp:
                 f"无法创建本次会话日志目录：{error}",
                 parent=self.root,
             )
+
+    def _change_portal_option(self):
+        previous=self.config.portal_enabled
+        enabled=self.portal_enabled_var.get()
+        self.config.portal_enabled=enabled
+        try:
+            self.config.save()
+        except OSError as error:
+            self.config.portal_enabled=previous
+            self.portal_enabled_var.set(previous)
+            messagebox.showerror("保存失败",str(error),parent=self.root)
+            return
+        LOG.info("灵魂石选项已保存：enabled=%s，工作中=%s",enabled,self.round_active_event.is_set())
+        if not enabled:
+            self.portal_check_event.clear()
+        elif not previous and not self.round_active_event.is_set():
+            self.portal_check_event.set()
+            self._post_status("灵魂石检查已排队；暂停时将在恢复托管后执行")
 
     def _change_interval(self, _event: object | None = None) -> None:
         option = self.interval_var.get()
@@ -530,10 +555,13 @@ class TaskbarHeroApp:
             if self.config.calibration is None or not self.gate.enabled:
                 time.sleep(0.2)
                 continue
-            if not self.run_now_event.is_set() and not self.schedule.is_due(time.monotonic()):
+            due=self.run_now_event.is_set() or self.schedule.is_due(time.monotonic())
+            portal_only=not due and self.portal_check_event.is_set() and self.config.portal_enabled
+            if not due and not portal_only:
                 time.sleep(0.25)
                 continue
             self.run_now_event.clear()
+            self.portal_check_event.clear()
             generation = self.gate.generation
             calibration = self.config.calibration
             if calibration is None:
@@ -550,31 +578,45 @@ class TaskbarHeroApp:
                     ("detected_scale", (calibration, scale))
                 ),
             )
+            driver.diagnostics_enabled = lambda: self.diagnostics_dir is not None and self.diagnostics_dir == driver.diagnostics_dir
+            driver.portal_option_enabled = lambda:self.config.portal_enabled
             engine = SynthesisEngine(
                 driver,
+                portal_enabled=lambda:self.config.portal_enabled,
                 max_combinations_per_category=self.config.max_combinations_per_category,
                 logger=LOG,
                 status=self._post_status,
             )
+            LOG.info("开始%s，灵魂石选项=%s", "独立灵魂石检查" if portal_only else "合成轮次",self.config.portal_enabled)
             self.round_active_event.set()
             try:
                 with self._automation_lock:
-                    result = engine.run_round()
+                    if portal_only:
+                        if self.config.portal_enabled:
+                            driver.check_boss_portal()
+                    else:
+                        self.portal_check_event.clear()
+                        result = engine.run_round()
             except RoundCancelled:
                 LOG.info("本轮已取消")
                 continue
             except AutomationError as error:
+                driver.record_problem(f"自动化安全暂停：{error}", desktop=True)
                 LOG.error("自动化安全暂停：%s", error)
                 self.gate.pause(cancel_round=True)
                 self.ui_queue.put(("error", str(error)))
                 continue
             except Exception as error:  # 最后一道安全边界：任何未知异常都停止点击。
+                driver.record_problem(f"未处理异常：{error}", desktop=True)
                 LOG.exception("未处理异常，自动化已暂停")
                 self.gate.pause(cancel_round=True)
                 self.ui_queue.put(("error", f"发生异常：{error}"))
                 continue
             finally:
                 self.round_active_event.clear()
+            if portal_only:
+                self._post_status("灵魂石检查完成，继续等待原定合成时间")
+                continue
             self.ui_queue.put(("round", result.total))
             self.schedule.complete_round(time.monotonic())
             self._post_status(
@@ -593,6 +635,8 @@ class TaskbarHeroApp:
             self._set_status("已暂停", "不会执行任何鼠标操作", "#666666")
 
     def emergency_stop(self) -> None:
+        if getattr(self,'portal_check_event',None) is not None:
+            self.portal_check_event.clear()
         if self._auto_detecting:
             cancel_event = self._auto_detection_cancel
             if cancel_event is not None:
@@ -782,6 +826,10 @@ class TaskbarHeroApp:
             )
         except Exception as error:
             LOG.exception("自动识别位置失败")
+            from .diagnostics import record_event
+            record_event(self.diagnostics_dir,f"自动识别位置失败：{error}",
+                         frame=(image,width,height) if image is not None and width>0 and height>0 else None,
+                         desktop=True)
             failure_path = None
             if (
                 self.diagnostics_dir is not None

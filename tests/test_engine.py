@@ -17,6 +17,16 @@ class FakeDriver:
         self.readiness = iter(readiness)
         self.actions: list[str] = []
 
+    def check_boss_portal(self) -> bool:
+        self.actions.append("portal-check")
+        return False
+
+    def recover_server_error(self) -> bool:
+        return False
+
+    def open_chests(self) -> None:
+        self.actions.append("space")
+
     def prepare_interface(self) -> None:
         self.actions.append("prepare")
 
@@ -45,6 +55,57 @@ class FakeDriver:
 
 
 class SynthesisEngineTests(unittest.TestCase):
+    def test_portal_default_off_but_space_runs_once_before_fill(self):
+        driver=FakeDriver([False]*4)
+        SynthesisEngine(driver).run_round()
+        self.assertNotIn('portal-check',driver.actions)
+        self.assertEqual(driver.actions.count('space'),1)
+        self.assertLess(driver.actions.index('prepare'),driver.actions.index('space'))
+        self.assertLess(driver.actions.index('space'),driver.actions.index('fill'))
+
+    def test_failed_server_attempt_still_counts_toward_click_safety_limit(self):
+        from unittest.mock import Mock
+        driver=FakeDriver([True,True])
+        driver.recover_server_error=Mock(side_effect=[True,False])
+        with self.assertRaisesRegex(AutomationError,"安全上限 2"):
+            SynthesisEngine(driver,max_combinations_per_category=2).run_round()
+        self.assertEqual(driver.actions.count("combine"),2)
+
+    def test_server_error_returns_items_and_refills_without_counting_failed_attempt(self):
+        from unittest.mock import Mock
+        driver=FakeDriver([True,True,False,False,False,False])
+        driver.recover_server_error=Mock(side_effect=[True,False])
+        result=SynthesisEngine(driver).run_round()
+        self.assertEqual(result.total,1)
+        first=driver.actions.index("wait-combine")
+        self.assertEqual(driver.actions[first+1:first+5],["checkpoint","return","checkpoint","fill"])
+
+    def test_repeated_server_errors_pause_at_three(self):
+        from unittest.mock import Mock
+        driver=FakeDriver([True]*3)
+        driver.recover_server_error=Mock(return_value=True)
+        with self.assertRaisesRegex(AutomationError,"3"):
+            SynthesisEngine(driver).run_round()
+        self.assertEqual(driver.actions.count("combine"),3)
+
+    def test_portal_is_checked_once_after_prepare_and_space(self):
+        driver = FakeDriver([False]*8)
+        engine = SynthesisEngine(driver,portal_enabled=lambda:True)
+        engine.run_round()
+        engine.run_round()
+        self.assertEqual(driver.actions.count("portal-check"), 2)
+        for index, action in enumerate(driver.actions):
+            if action == "portal-check":
+                self.assertEqual(driver.actions[index-4:index], ["prepare","checkpoint","space","checkpoint"])
+
+    def test_cancelled_portal_check_never_starts_synthesis(self):
+        from unittest.mock import Mock
+        driver = FakeDriver([])
+        driver.check_boss_portal = Mock(side_effect=RoundCancelled)
+        with self.assertRaises(RoundCancelled):
+            SynthesisEngine(driver,portal_enabled=lambda:True).run_round()
+        self.assertNotIn("fill",driver.actions)
+
     def test_blue_button_combines_and_only_equipment_and_material_are_selected(self) -> None:
         driver = FakeDriver([True, False, False, False, False])
         result = SynthesisEngine(driver).run_round()

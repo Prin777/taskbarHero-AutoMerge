@@ -51,7 +51,13 @@ class RunSchedule:
 
 
 class AutomationDriver(Protocol):
+    def recover_server_error(self) -> bool: ...
+
+    def check_boss_portal(self) -> bool: ...
+
     def prepare_interface(self) -> None: ...
+
+    def open_chests(self) -> None: ...
 
     def checkpoint(self) -> None: ...
 
@@ -88,16 +94,26 @@ class SynthesisEngine:
         max_combinations_per_category: int = 100,
         logger: logging.Logger | None = None,
         status: Callable[[str], None] | None = None,
+        portal_enabled: Callable[[], bool] | None = None,
     ) -> None:
+        self.portal_enabled = portal_enabled or (lambda:False)
         self.driver = driver
         self.max_combinations = max_combinations_per_category
         self.log = logger or logging.getLogger(__name__)
         self.status = status or (lambda _message: None)
 
     def run_round(self) -> RoundResult:
-        # 自动找到游戏，并在需要时打开英雄背包与魔方合成窗口。
         self.status("正在查找游戏并准备合成界面")
         self.driver.prepare_interface()
+        self.driver.checkpoint()
+        self.status("模板比例已确认，按空格打开箱子")
+        self.driver.open_chests()
+        if self.portal_enabled():
+            self.status("合成前检查 3-10 入口与灵魂石数量（需大于 5）")
+            self.driver.checkpoint()
+            if self.driver.check_boss_portal():
+                self.driver.prepare_interface()
+            self.driver.checkpoint()
         # 清理上次暂停或异常时可能留在合成区域中的物品。
         self.driver.checkpoint()
         self.driver.click_return_items()
@@ -116,8 +132,10 @@ class SynthesisEngine:
         self.driver.checkpoint()
         self.driver.select_category(category)
         combinations = 0
+        server_errors = 0
+        attempts = 0
 
-        while combinations < self.max_combinations:
+        while attempts < self.max_combinations:
             self.driver.checkpoint()
             self.status(f"{category.value}：正在自动填充")
             self.driver.click_auto_fill()
@@ -130,8 +148,13 @@ class SynthesisEngine:
 
             # 是否合成只服从游戏自身的按钮状态，不再读取九宫格画面。
             if combine_ready:
-                self._combine(category, combinations + 1)
-                combinations += 1
+                attempts += 1
+                if self._combine(category, combinations + 1):
+                    combinations += 1
+                else:
+                    server_errors += 1
+                    if server_errors >= 3:
+                        raise AutomationError("本类别服务器错误累计达到 3 次，已安全暂停")
                 continue
 
             # 第一次按钮一直未激活：全部退回后再次填充，以排除界面瞬态或残留。
@@ -147,8 +170,13 @@ class SynthesisEngine:
             )
 
             if retry_ready:
-                self._combine(category, combinations + 1)
-                combinations += 1
+                attempts += 1
+                if self._combine(category, combinations + 1):
+                    combinations += 1
+                else:
+                    server_errors += 1
+                    if server_errors >= 3:
+                        raise AutomationError("本类别服务器错误累计达到 3 次，已安全暂停")
                 continue
 
             # 第二次按钮仍未激活时也退回，避免残留物品影响下一类别。
@@ -160,12 +188,18 @@ class SynthesisEngine:
             f"{category.value}单轮已达到安全上限 {self.max_combinations} 次，已暂停以防止死循环"
         )
 
-    def _combine(self, category: Category, sequence: int) -> None:
+    def _combine(self, category: Category, sequence: int) -> bool:
         self.driver.checkpoint()
         self.status(f"{category.value}：合成按钮已高亮，正在合成（第 {sequence} 次）")
         self.driver.click_combine()
         # 等待合成动画后直接回到循环；下一次自动填充只检查按钮是否激活。
         self.driver.wait_for_combination()
+        self.driver.checkpoint()
+        if self.driver.recover_server_error():
+            self.status("服务器错误已确认，正在退回物品并重新填充")
+            self.driver.click_return_items()
+            return False
+        return True
 
 
 class ControlGate:

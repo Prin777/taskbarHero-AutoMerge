@@ -556,6 +556,7 @@ def click_game_point(
     label: str,
     *,
     wait: Callable[[float], None] | None = None,
+    before_press: Callable[[], None] | None = None,
 ) -> None:
     """校准前只允许在已识别游戏客户区的可见位置执行一次安全点击。"""
     pause = wait or time.sleep
@@ -570,6 +571,8 @@ def click_game_point(
         if not user32.SetCursorPos(screen.x, screen.y):
             raise ValueError(f"无法移动鼠标到{label}")
         pause(CURSOR_SETTLE_SECONDS)
+        if before_press is not None:
+            before_press()
         if get_foreground_root() != _root_window(hwnd) or not point_is_safe_on_active_game(
             hwnd,
             screen,
@@ -859,6 +862,10 @@ def blue_highlight_ratio(image_bgra: bytes) -> float:
     return highlighted / pixels
 
 
+class PortalFrameUnconfirmed(AutomationError):
+    """A single current frame did not grant permission to click."""
+
+
 class Win32AutomationDriver:
     def __init__(
         self,
@@ -887,6 +894,33 @@ class Win32AutomationDriver:
             if diagnostics_dir is not None
             else 0
         )
+
+    def _capture_frame(self, hwnd):
+        frame=capture_client_bgra(hwnd)
+        self._last_diagnostic_frame=frame
+        self._last_frame_time=datetime.now().isoformat()
+        return frame
+
+    def record_problem(self, reason, *, frame=None, target=None, desktop=False):
+        if getattr(self,'diagnostics_dir',None) is None or not getattr(self,'diagnostics_enabled',lambda:True)():
+            return
+        from .diagnostics import record_event
+        try:
+            foreground=get_foreground_root()
+            metadata={
+                'foreground_hwnd':foreground,
+                'foreground_title':get_window_title(foreground),
+                'foreground_class':get_class_name(foreground),
+                'foreground_process':get_process_name(foreground),
+                'target':None if target is None else {'x':target.x,'y':target.y},
+                'last_game_frame_time':getattr(self,'_last_frame_time',None),
+                'game_frame_note':'最后一次采集的游戏帧；桌面图为事件时截图',
+            }
+        except Exception:
+            metadata={'foreground_metadata':'unavailable'}
+        return record_event(self.diagnostics_dir,reason,
+            frame=frame if frame is not None else getattr(self,'_last_diagnostic_frame',None),
+            metadata=metadata,desktop=desktop)
 
     def _foreground(self) -> int:
         return find_taskbar_hero_window(self.calibration.window)
@@ -945,6 +979,107 @@ class Win32AutomationDriver:
             result.anchor.y,
             result.scale,
         )
+
+    def open_chests(self):
+        self.checkpoint()
+        hwnd=self._foreground()
+        def wait(seconds):
+            self.gate.interruptible_wait(seconds,self.generation)
+            self.checkpoint()
+        with temporarily_uncover_window(hwnd,wait=wait):
+            self.checkpoint()
+            if get_foreground_root()!=_root_window(hwnd):
+                raise AutomationError("打开箱子前游戏失去前台")
+            try:
+                user32.keybd_event(0x20,0,0,0)
+            finally:
+                user32.keybd_event(0x20,0,KEYEVENTF_KEYUP,0)
+            LOG.info("模板比例确认后已发送一次空格，打开箱子")
+            wait(0.5)
+
+    def _boss_checkpoint(self):
+        self._portal_checkpoint()
+        if not getattr(self,'portal_option_enabled',lambda:True)():
+            raise RoundCancelled()
+
+    def _portal_checkpoint(self):
+        if self.gate.shutdown_requested or self.gate.generation != self.generation or not self.gate.enabled:
+            raise RoundCancelled()
+
+    def check_boss_portal(self) -> bool:
+        self._boss_checkpoint()
+        self.checkpoint()
+        hwnd = self._foreground()
+        def wait(seconds):
+            self.gate.interruptible_wait(seconds,self.generation)
+            self.checkpoint()
+        with temporarily_uncover_window(hwnd,wait=wait):
+            self.checkpoint()
+            for attempt in range(3):
+                self._boss_checkpoint()
+                try:
+                    return self._check_boss_portal_active()
+                except PortalFrameUnconfirmed as error:
+                    LOG.info("传送门当前帧未确认（%s/3）：%s；本次未点击",attempt+1,error)
+                    self.record_problem(f"传送门当前帧未确认（{attempt+1}/3）：{error}",target=getattr(self,'_last_portal_target',None))
+                    if attempt==2:
+                        self.status("传送门连续未确认，本轮跳过入口并继续合成")
+                        LOG.info("传送门三次未确认，未点击，继续原有流程")
+                        return False
+                    self._boss_checkpoint()
+                    self.checkpoint()
+                    if get_foreground_root()!=_root_window(hwnd):
+                        raise AutomationError("传送门重试前游戏失去前台")
+                    # Move away without clicking so a prior hover cannot hide the stage label.
+                    point=Point(self.calibration.window.client_width//2,self.calibration.window.client_height//2)
+                    screen=client_to_screen(hwnd,point)
+                    if not user32.SetCursorPos(screen.x,screen.y):
+                        raise AutomationError("无法清除入口悬停，已暂停")
+                    wait(0.6)
+
+    def _check_boss_portal_active(self) -> bool:
+        """Inspect only the calibrated game and retain all pre-click checks."""
+        from .portal import find_ready_portal
+        self.checkpoint()
+        hwnd = self._foreground()
+        image, width, height = self._capture_frame(hwnd)
+        if (width, height) != (self.calibration.window.client_width, self.calibration.window.client_height):
+            raise AutomationError("挑战入口监测时游戏客户区尺寸变化")
+        self.checkpoint()
+        target = find_ready_portal(image,width,height,checkpoint=self._boss_checkpoint,
+                                   prefer_ocr=True,allow_template_fallback=False)
+        self.checkpoint()
+        if target is None:
+            raise PortalFrameUnconfirmed("未同时确认入口标签和达标数量")
+        self._last_portal_target=target
+        self.record_problem("传送门已识别，准备连续复核",frame=(image,width,height),target=target)
+        LOG.info("传送门检查通过，正在连续复核")
+        def verify_wait(seconds: float, *, hover=False) -> None:
+            self.gate.interruptible_wait(seconds, self.generation)
+            self.checkpoint()
+            if get_foreground_root() != _root_window(hwnd):
+                self.record_problem("挑战入口复核时游戏失去前台",target=target,desktop=True)
+                raise AutomationError("挑战入口复核时游戏失去前台")
+            frame, w, h = self._capture_frame(hwnd)
+            self.checkpoint()
+            fresh = find_ready_portal(frame,w,h,checkpoint=self._boss_checkpoint,prefer_ocr=True,
+                                      hover_target=target if hover else None,allow_template_fallback=False)
+            if (w,h)!=(width,height):
+                raise AutomationError("挑战入口复核时窗口尺寸变化")
+            if fresh is None:
+                raise PortalFrameUnconfirmed(f"{'按下前' if hover else '连续确认'}：当前帧标签或达标数量未确认（不代表实际数量变化）")
+            if abs(fresh.x-target.x)>4 or abs(fresh.y-target.y)>4:
+                raise AutomationError("挑战入口位置发生变化，已取消点击")
+            self.checkpoint()
+            self._boss_checkpoint()
+        verify_wait(0.20)
+        def cancellable_wait(seconds):
+            self.gate.interruptible_wait(seconds,self.generation)
+            self.checkpoint()
+        click_game_point(hwnd,target,"3-10 挑战入口",wait=cancellable_wait,
+                         before_press=lambda:verify_wait(0,hover=True))
+        self.status("已点击 3-10 挑战入口，等待游戏自动返回")
+        return True
 
     def _button_sample_size(self) -> int:
         return combine_button_sample_size(getattr(self, "_interface_scale", 1.0))
@@ -1026,7 +1161,7 @@ class Win32AutomationDriver:
         return blue_highlight_ratio(image), image
 
     def _save_button_diagnostic(self, image: bytes, ratio: float, enabled: bool) -> None:
-        if self.diagnostics_dir is None or self._diagnostic_index >= MAX_DIAGNOSTIC_SCREENSHOTS:
+        if self.diagnostics_dir is None or not getattr(self,'diagnostics_enabled',lambda:True)() or self._diagnostic_index >= MAX_DIAGNOSTIC_SCREENSHOTS:
             return
         try:
             self._diagnostic_index += 1
@@ -1088,6 +1223,51 @@ class Win32AutomationDriver:
                 COMBINE_BUTTON_CONFIRM_INTERVAL_SECONDS,
                 self.generation,
             )
+
+    def recover_server_error(self) -> bool:
+        self.checkpoint()
+        hwnd = self._foreground()
+        def wait(seconds):
+            self.gate.interruptible_wait(seconds,self.generation)
+            self.checkpoint()
+        with temporarily_uncover_window(hwnd,wait=wait):
+            self.checkpoint()
+            started=time.monotonic()
+            result=self._recover_server_error_active()
+            LOG.info("服务器弹窗检查耗时 %.3f 秒，发现错误=%s",time.monotonic()-started,result)
+            return result
+
+    def _recover_server_error_active(self) -> bool:
+        from .server_error import find_server_error
+        self.checkpoint()
+        hwnd = self._foreground()
+        frame, width, height = self._capture_frame(hwnd)
+        def detect(frame, w, h):
+            self.checkpoint()
+            if (w,h) != (self.calibration.window.client_width,self.calibration.window.client_height):
+                raise AutomationError("错误弹窗处理期间窗口尺寸变化")
+            return find_server_error(frame,w,h,checkpoint=self._portal_checkpoint)
+        target = detect(frame,width,height)
+        if target is not None:
+            self.record_problem("服务器错误弹窗",frame=(frame,width,height),target=target)
+            LOG.info("识别到服务器错误弹窗，正在复核确认按钮")
+        if target is None:
+            return False
+        def verify(seconds):
+            self.gate.interruptible_wait(seconds,self.generation)
+            if get_foreground_root() != _root_window(hwnd):
+                raise AutomationError("确认服务器错误前游戏失去前台")
+            f,w,h = self._capture_frame(hwnd)
+            if detect(f,w,h) != target:
+                raise AutomationError("服务器错误弹窗发生变化，已取消确认")
+            self.checkpoint()
+        verify(0.20)
+        click_game_point(hwnd,target,"服务器错误确认",wait=verify)
+        self.gate.interruptible_wait(0.30,self.generation)
+        f,w,h = self._capture_frame(hwnd)
+        if detect(f,w,h) is not None:
+            raise AutomationError("服务器错误弹窗未关闭，已暂停")
+        return True
 
     def click_combine(self) -> None:
         # 上层只有在连续确认合成按钮为蓝色高亮时才会调用。
